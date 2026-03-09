@@ -1,3 +1,4 @@
+from __future__ import annotations
 """DB access layer for workflow engine tables."""
 
 import json
@@ -127,6 +128,14 @@ class WorkflowDB:
                 "WHERE id=?", (status, instance_id),
             )
 
+    def update_instance_config(self, instance_id: int, config: dict):
+        with self.db.connection() as conn:
+            conn.execute(
+                "UPDATE workflow_instances SET config_json=?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE id=?",
+                (json.dumps(config), instance_id),
+            )
+
     # --- Steps ---
 
     def create_step(self, instance_id: int, step_id: str, step_type: str,
@@ -203,13 +212,31 @@ class WorkflowDB:
                 ).fetchall()
             return [dict(r) for r in rows]
 
-    def save_gate_payload(self, instance_id: int, step_id: str, payload: dict):
+    def save_step_outputs(self, instance_id: int, step_id: str, outputs: dict):
         with self.db.connection() as conn:
             conn.execute(
                 "UPDATE instance_steps SET outputs_json=? "
                 "WHERE instance_id=? AND step_id=?",
-                (json.dumps(payload), instance_id, step_id),
+                (json.dumps(outputs), instance_id, step_id),
             )
+
+    def save_gate_payload(self, instance_id: int, step_id: str, payload: dict):
+        self.save_step_outputs(instance_id, step_id, payload)
+
+    def reset_steps(self, instance_id: int, step_ids: list[str]):
+        """Reset steps to pending, clearing outputs and errors."""
+        with self.db.connection() as conn:
+            for sid in step_ids:
+                conn.execute(
+                    "UPDATE instance_steps SET status='pending', outputs_json=NULL, "
+                    "error_message=NULL, started_at=NULL, completed_at=NULL "
+                    "WHERE instance_id=? AND step_id=?",
+                    (instance_id, sid),
+                )
+                conn.execute(
+                    "DELETE FROM instance_artifacts WHERE instance_id=? AND step_id=?",
+                    (instance_id, sid),
+                )
 
     # --- Agents ---
 
@@ -252,3 +279,252 @@ class WorkflowDB:
                 (name, agent_type, model, json.dumps(config_json or {})),
             )
             return cursor.lastrowid
+
+    # --- Expert Domains ---
+
+    def list_expert_domains(self, active_only: bool = True,
+                            repo: Optional[str] = None) -> list[dict]:
+        with self.db.connection() as conn:
+            conditions = []
+            params: list = []
+            if active_only:
+                conditions.append("is_active=1")
+            if repo is not None:
+                conditions.append("repo=?")
+                params.append(repo)
+            where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+            rows = conn.execute(
+                f"SELECT * FROM expert_domains{where} ORDER BY domain_id",
+                params,
+            ).fetchall()
+            results = []
+            for r in rows:
+                d = dict(r)
+                d["triggers"] = json.loads(d.get("triggers_json") or "{}")
+                d["checklist"] = json.loads(d.get("checklist_json") or "[]")
+                d["anti_patterns"] = json.loads(d.get("anti_patterns_json") or "[]")
+                results.append(d)
+            return results
+
+    def insert_ai_expert_domains(self, repo: str, experts: list[dict]) -> list[int]:
+        """Insert AI-generated expert domains for a specific repo.
+
+        Each expert dict should have: domain_id, display_name, persona, scope,
+        checklist, anti_patterns. Triggers are left empty for AI-generated domains.
+        Returns a list of inserted row IDs.
+        """
+        ids = []
+        with self.db.connection() as conn:
+            for expert in experts:
+                domain_id = f"{repo.replace('/', '-')}-{expert['domain_id']}"
+                existing = conn.execute(
+                    "SELECT id FROM expert_domains WHERE domain_id=?", (domain_id,)
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        "UPDATE expert_domains SET display_name=?, persona=?, scope=?, "
+                        "triggers_json=?, checklist_json=?, anti_patterns_json=?, "
+                        "is_active=1 WHERE domain_id=?",
+                        (expert["display_name"], expert["persona"], expert["scope"],
+                         json.dumps(expert.get("triggers", {})),
+                         json.dumps(expert.get("checklist", [])),
+                         json.dumps(expert.get("anti_patterns", [])),
+                         domain_id),
+                    )
+                    ids.append(existing["id"])
+                else:
+                    cursor = conn.execute(
+                        "INSERT INTO expert_domains "
+                        "(domain_id, display_name, persona, scope, triggers_json, "
+                        "checklist_json, anti_patterns_json, is_builtin, is_active, repo) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?)",
+                        (domain_id, expert["display_name"], expert["persona"],
+                         expert["scope"], json.dumps(expert.get("triggers", {})),
+                         json.dumps(expert.get("checklist", [])),
+                         json.dumps(expert.get("anti_patterns", [])),
+                         repo),
+                    )
+                    ids.append(cursor.lastrowid)
+        return ids
+
+    def get_expert_domain(self, domain_id: str) -> Optional[dict]:
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM expert_domains WHERE domain_id=?", (domain_id,)
+            ).fetchone()
+            if row:
+                d = dict(row)
+                d["triggers"] = json.loads(d.get("triggers_json") or "{}")
+                d["checklist"] = json.loads(d.get("checklist_json") or "[]")
+                d["anti_patterns"] = json.loads(d.get("anti_patterns_json") or "[]")
+                return d
+            return None
+
+    def create_expert_domain(self, domain_id: str, display_name: str, persona: str,
+                             scope: str, triggers: dict, checklist: list,
+                             anti_patterns: Optional[list] = None,
+                             is_builtin: bool = True,
+                             repo: Optional[str] = None) -> int:
+        with self.db.connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO expert_domains "
+                "(domain_id, display_name, persona, scope, triggers_json, "
+                "checklist_json, anti_patterns_json, is_builtin, repo) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (domain_id, display_name, persona, scope,
+                 json.dumps(triggers), json.dumps(checklist),
+                 json.dumps(anti_patterns or []), is_builtin, repo),
+            )
+            return cursor.lastrowid
+
+    def upsert_expert_domain(self, domain_id: str, display_name: str, persona: str,
+                             scope: str, triggers: dict, checklist: list,
+                             anti_patterns: Optional[list] = None,
+                             is_builtin: bool = True,
+                             repo: Optional[str] = None) -> int:
+        with self.db.connection() as conn:
+            existing = conn.execute(
+                "SELECT id FROM expert_domains WHERE domain_id=?", (domain_id,)
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE expert_domains SET display_name=?, persona=?, scope=?, "
+                    "triggers_json=?, checklist_json=?, anti_patterns_json=?, repo=? "
+                    "WHERE domain_id=?",
+                    (display_name, persona, scope, json.dumps(triggers),
+                     json.dumps(checklist), json.dumps(anti_patterns or []),
+                     repo, domain_id),
+                )
+                return existing["id"]
+            return self.create_expert_domain(
+                domain_id, display_name, persona, scope,
+                triggers, checklist, anti_patterns, is_builtin, repo)
+
+    def update_expert_domain(self, domain_id: str, **kwargs):
+        sets = []
+        params = []
+        for key in ("display_name", "persona", "scope", "is_active"):
+            if key in kwargs:
+                sets.append(f"{key}=?")
+                params.append(kwargs[key])
+        for key in ("triggers", "checklist", "anti_patterns"):
+            if key in kwargs:
+                sets.append(f"{key}_json=?")
+                params.append(json.dumps(kwargs[key]))
+        if not sets:
+            return
+        params.append(domain_id)
+        with self.db.connection() as conn:
+            conn.execute(
+                f"UPDATE expert_domains SET {', '.join(sets)} WHERE domain_id=?",
+                params,
+            )
+
+    def delete_expert_domain(self, domain_id: str):
+        with self.db.connection() as conn:
+            conn.execute(
+                "DELETE FROM expert_domains WHERE domain_id=? AND is_builtin=0",
+                (domain_id,),
+            )
+
+    # --- Follow-ups ---
+
+    def create_followup(self, instance_id: int, pr_number: int, repo: str,
+                        source_run_id: int, verdict: str,
+                        review_sha: Optional[str] = None) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.db.connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO review_followups "
+                "(instance_id, pr_number, repo, source_run_id, verdict, "
+                "review_sha, published_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (instance_id, pr_number, repo, source_run_id, verdict,
+                 review_sha, now),
+            )
+            return cursor.lastrowid
+
+    def get_followup(self, followup_id: int) -> Optional[dict]:
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM review_followups WHERE id=?", (followup_id,)
+            ).fetchone()
+            return dict(row) if row else None
+
+    def list_followups(self, repo: Optional[str] = None,
+                       status: Optional[str] = None) -> list[dict]:
+        conditions = []
+        params: list = []
+        if repo:
+            conditions.append("repo=?")
+            params.append(repo)
+        if status == "active":
+            conditions.append(
+                "status NOT IN ('RESOLVED','CONCEDED','MERGED','CLOSED','WONTFIX')"
+            )
+        elif status:
+            conditions.append("status=?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM review_followups{where} ORDER BY created_at DESC",
+                params,
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def update_followup_status(self, followup_id: int, status: str,
+                               notes: Optional[str] = None):
+        now = datetime.now(timezone.utc).isoformat()
+        with self.db.connection() as conn:
+            conn.execute(
+                "UPDATE review_followups SET status=?, last_checked=?, notes=? "
+                "WHERE id=?",
+                (status, now, notes, followup_id),
+            )
+
+    def create_followup_finding(self, followup_id: int, finding_id: str,
+                                original_text: str, severity: str) -> int:
+        with self.db.connection() as conn:
+            cursor = conn.execute(
+                "INSERT INTO followup_findings "
+                "(followup_id, finding_id, original_text, severity) "
+                "VALUES (?, ?, ?, ?)",
+                (followup_id, finding_id, original_text, severity),
+            )
+            return cursor.lastrowid
+
+    def update_followup_finding(self, finding_id: int, status: str,
+                                author_response: Optional[str] = None,
+                                resolution_notes: Optional[str] = None):
+        now = datetime.now(timezone.utc).isoformat()
+        with self.db.connection() as conn:
+            conn.execute(
+                "UPDATE followup_findings SET status=?, author_response=?, "
+                "resolution_notes=?, updated_at=? WHERE id=?",
+                (status, author_response, resolution_notes, now, finding_id),
+            )
+
+    # --- Code Owners ---
+
+    def upsert_code_owner(self, github_handle: str, display_name: str,
+                          priority_boost: int = 0, is_reviewer: bool = True):
+        with self.db.connection() as conn:
+            existing = conn.execute(
+                "SELECT id FROM code_owner_registry WHERE github_handle=?",
+                (github_handle,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO code_owner_registry "
+                    "(github_handle, display_name, priority_boost, is_reviewer) "
+                    "VALUES (?, ?, ?, ?)",
+                    (github_handle, display_name, priority_boost, is_reviewer),
+                )
+
+    def get_followup_findings(self, followup_id: int) -> list[dict]:
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                "SELECT * FROM followup_findings WHERE followup_id=? ORDER BY id",
+                (followup_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]

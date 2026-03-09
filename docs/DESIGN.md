@@ -432,13 +432,14 @@ The frontend uses React 18 with TypeScript, built via Vite. State management use
 
 #### Main Tab Architecture
 
-The application uses a 3-tab layout as the primary navigation:
+The application uses a 4-tab layout as the primary navigation:
 
 | Tab | View Key | Description |
 |-----|----------|-------------|
 | Pull Requests | `prs` | PR list with filters, pagination, and action buttons |
 | Analytics | `analytics` | 5 sub-tabs for developer and repository analytics |
 | CI/Workflows | `workflows` | Workflow run history with filters and aggregate stats |
+| Review Workflows | `engine` | Composable review pipeline runs with human gates |
 
 #### Analytics Sub-tabs
 
@@ -449,6 +450,149 @@ The application uses a 3-tab layout as the primary navigation:
 | Activity | `activity` | Code activity charts: commits, code changes, top 5 contributors |
 | Reviews | `responsiveness` | Per-reviewer response times, leaderboard, bottleneck detection |
 | Contributors | `contributors` | Interactive per-contributor time series charts (commits, additions, deletions) |
+
+### Workflow Engine (Review Workflows Tab)
+
+The Review Workflows tab provides a UI for composable code review pipelines implementing the legacy adversarial review system. Built on a generic workflow engine with typed step executors, fan-out/fan-in parallelism, human gates, and expert domain selection.
+
+#### Backend Packages
+
+**Agents** (`backend/agents/`):
+
+| Module | Description |
+|--------|-------------|
+| `base.py` | `AgentBackend` ABC with `start_review`, `check_status`, `get_output`, `cancel`, `cleanup` lifecycle methods; `AgentHandle`, `AgentStatus`, `ReviewArtifact` |
+| `claude_cli.py` | `ClaudeCLIAgent` — wraps subprocess calls to `claude` CLI with live output streaming. `cancel()` terminates subprocess and calls `cleanup()` to close pipes and remove `_processes` entries |
+| `openai_api.py` | `OpenAIAgent` — OpenAI chat completions via `httpx` |
+| `cursor_cli.py` | `CursorCLIAgent` — wraps `agent` CLI with stream-json live output. `cancel()` terminates subprocess and calls `cleanup()` |
+| `pid_tracker.py` | Persists active agent subprocess PIDs to `active_agent_pids` table. `register_pid()` on start, `unregister_pid()` on cleanup, `kill_all_tracked()` on server boot to SIGTERM orphaned processes |
+| `registry.py` | `get_agent(name)`, `list_agents()`, agent type registry |
+
+**Workflows** (`backend/workflows/`):
+
+| Module | Description |
+|--------|-------------|
+| `step_types.py` | `StepType` enum, `@register_step` decorator, `STEP_REGISTRY` |
+| `executor.py` | `StepExecutor` ABC, `StepResult` dataclass |
+| `runtime.py` | `WorkflowRuntime` — level-based parallel execution, fan-out, gate pausing. `_is_cancelled()` checks between levels for cooperative cancellation. `resume_after_gate()` and `retry_from_step()` pre-populate `step_outputs` from DB for correct upstream data routing. `_merge_outputs()` concatenates list-valued keys in `_MERGEABLE_LIST_KEYS` (reviews, findings, followup_results). Module-level `merge_outputs()` alias used by route handlers for consistent output reconstruction |
+| `cancellation.py` | Cooperative cancellation registry: `cancel()` signals instance cancellation and terminates registered agents; `is_cancelled()` checked by all polling loops and between runtime levels; `clear()` called by all lifecycle endpoints (run/resume/retry) in `finally` blocks; `register_agent()`/`unregister_agent()` for tracking live agents. `AGENT_POLL_TIMEOUT` (30min) prevents infinite hangs |
+| `seed.py` | Built-in templates (Quick/Team/Self/Deep/Follow-Up Review), agents, 10 expert domains, code owners. Uses `WorkflowDB.upsert_code_owner()` abstraction |
+
+**Step Executors** (`backend/workflows/executors/`):
+
+| Module | Step Type | Description |
+|--------|-----------|-------------|
+| `pr_select.py` | `pr_select` | Fetches PRs via `gh` CLI |
+| `prioritize.py` | `prioritize` | P0-P3 scoring, code owner boost, repo-scoped skip list |
+| `expert_select.py` | `expert_select` | DB-backed domain matching with file/keyword triggers, relevance thresholds, expert count caps |
+| `prompt_generate.py` | `prompt_generate` | Structured prompt builder: header, context commands, GitHub API dedup, persona, checklist, anti-patterns, cross-cutting concerns, depth expectations, cross-file analysis, diff ingestion strategy, output format. Per-expert fan-out for self/deep review |
+| `agent_review.py` | `agent_review` | Dispatches prompt to `AgentBackend`, Review B isolation, live output streaming, domain propagation |
+| `synthesis.py` | `synthesis` | Source attribution (A/B/BOTH), synthesis log, NEEDS_DISCUSSION verdict, two-tier synthesis for self/deep review |
+| `freshness_check.py` | `freshness_check` | SUPERSEDED detection (force-push/rebase), per-finding staleness tagging, justification summaries |
+| `human_gate.py` | `human_gate` | Enriched gate payload: synthesis log, questions, checklists, per-domain synthesis, holistic review, staleness |
+| `publish.py` | `publish` | Rich GitHub comments with blocking findings (file:line, evidence, fix), questions, staleness notes, auto-creates follow-up entries. Multi-PR iteration via `per_pr` list. Publication dedup: fetches existing reviews/comments and filters already-raised findings before posting. Holistic enrichment: overlays holistic blocking/non-blocking/cross-cutting findings and verdict onto synthesis when available. Fallback for `pr_number` from `prs` list when two-tier synthesis omits top-level PR number. Owner/repo fallback from `full_repo`. Returns `StepResult(success=False)` on GitHub post failure |
+| `holistic_review.py` | `holistic_review` | Tier 2 analysis: cross-domain interactions, promotion/demotion logic, domain verdict summary |
+| `followup_check.py` | `followup_check` | Checks PR state, new commits, author responses; classifies follow-up status |
+| `followup_action.py` | `followup_action` | Posts follow-up comments using templates (RESOLVED, PARTIALLY_RESOLVED, AUTHOR_DISAGREES, NO_RESPONSE) |
+
+**Database** (`backend/database/workflows.py`): CRUD for templates, instances, steps, artifacts, agents, expert domains, follow-ups, code owners. `base.py` configures SQLite with WAL journal mode and 5s busy_timeout for safe concurrent access from parallel step execution.
+
+**Routes** (`backend/routes/workflow_engine_routes.py`): Template CRUD, instance lifecycle, gate actions (with per-instance mutex for idempotency), instance cancellation (signals running agents via cancellation registry), agent list, expert domain CRUD, follow-up listing. Resume/retry paths use `merge_outputs()` for correct list-valued key concatenation. Per-instance locks (`_get_instance_lock`) prevent duplicate concurrent retry/resume threads. `_set_terminal_status()` prevents background threads from overwriting `cancelled` DB status.
+
+#### Database Tables
+
+```sql
+-- Workflow templates (Quick Review, Team Review, Self-Review, Deep Review, Follow-Up Review)
+CREATE TABLE workflow_templates (id, name UNIQUE, description, template_json, is_builtin, created_at, updated_at);
+
+-- Workflow run instances
+CREATE TABLE workflow_instances (id, template_id FK, repo, status, config_json, created_at, updated_at);
+
+-- Per-step state within an instance
+CREATE TABLE instance_steps (id, instance_id FK, step_id, step_type, step_config_json, status, agent_id, inputs_json, outputs_json, started_at, completed_at, error_message);
+
+-- Artifacts produced by steps (reviews, synthesis, comments)
+CREATE TABLE instance_artifacts (id, instance_id FK, step_id, pr_number, artifact_type, file_path, content_json, created_at);
+
+-- Registered AI agents
+CREATE TABLE agents (id, name UNIQUE, type, model, config_json, is_active, created_at, updated_at);
+
+-- Code owner registry for priority scoring
+CREATE TABLE code_owner_registry (id, github_handle UNIQUE, display_name, priority_boost, is_reviewer, created_at, updated_at);
+
+-- PR skip list (repo-scoped)
+CREATE TABLE skip_list (id, pr_number, repo, reason, skipped_at, instance_id, UNIQUE(pr_number, repo));
+
+-- Expert domain catalog (10 built-in domains from legacy adversarial spec)
+CREATE TABLE expert_domains (id, domain_id UNIQUE, display_name, persona, scope, triggers_json, checklist_json, anti_patterns_json, is_builtin, is_active, created_at);
+
+-- Follow-up tracking for published reviews (ON DELETE CASCADE from workflow_instances)
+CREATE TABLE review_followups (id, instance_id, pr_number, repo, source_run_id FK CASCADE, verdict, published_at, review_sha, status DEFAULT 'NO_RESPONSE', last_checked, notes, created_at);
+-- Indexes: instance_id, repo+status, source_run_id
+
+-- Per-finding status within a follow-up (ON DELETE CASCADE from review_followups)
+CREATE TABLE followup_findings (id, followup_id FK CASCADE, finding_id, original_text, severity, status DEFAULT 'OPEN', author_response, resolution_notes, updated_at);
+-- Index: followup_id
+```
+
+#### Expert Domain Catalog
+
+10 built-in expert domains seeded from the legacy adversarial review specification:
+
+| Domain | Trigger Patterns | Trigger Keywords |
+|--------|-----------------|-----------------|
+| rust-api | `routes/*.rs`, `server/*.rs` | `axum::`, `StatusCode`, `handler`, `into_response`, `IntoResponse` |
+| database | `models/*.rs`, `migrations/`, `migrations_archive/`, `db/*.rs`, `seeds/*.sql`, `*.sql` | `sqlx::`, `BEGIN`, `COMMIT`, `transaction`, `.execute(`, `pg_dump`, `pg_restore`, `psql`, `backup`, `sync-db`, `connection_limit`, `CONNECTION LIMIT` |
+| s3-cloud | — | `s3_client`, `multipart`, `presign`, `upload_id`, `complete_multipart`, `abort_multipart`, `copy_object` |
+| concurrency | — | `claim_`, `status.*transition`, `Mutex`, `RwLock`, `atomic`, `race`, `CancellationToken`, `OCC`, `competing` |
+| security | `auth[_/]`, `security[_/]`, `middleware/` | `validate_`, `sanitize`, `traversal`, `../`, `role`, `permission`, `auth`, `RBAC`, `secret`, `credential`, `CORS`, `cors`, `rate_limit` |
+| testing | `tests/`, `#[test]`, `#[tokio::test]` | `assert`, `mock`, `fixture` |
+| infra-ci | `Dockerfile`, `.github/`, `Makefile`, `justfile`, `terraform/`, `*.tf`, `docker-compose` | `pipeline`, `deploy`, `workflow`, `runner`, `build_image`, `CI/CD`, `github_actions`, `release` |
+| go-backend | `*.go`, `go.mod` | `goroutine`, `chan`, `sync.`, `http.Handler` |
+| cpp-simulator | `*.cc`, `*.cpp`, `*.h` | `ns3::`, `Simulator::`, `congestion`, `cwnd` |
+| python-tooling | `*.py`, `requirements.txt`, `pyproject.toml`, `setup.py` | `pip` |
+
+Each domain includes: full persona text, review scope, 5-7 checklist items, 3-4 anti-patterns.
+
+#### Expert Selection Scoring Algorithm
+
+The `_compute_domain_relevance()` scorer uses multi-signal NLP-style matching with:
+
+- **Language exclusion**: Hard-excludes language-specific domains when PR files use a different language (e.g., cpp-simulator excluded from Rust-only PRs, shell-script domains excluded from pure-Rust/Go PRs). Recognized languages: Rust, Python, Go, C++, Java, Kotlin, Scala, JavaScript, TypeScript, Ruby, PHP, Bash/Shell
+- **Language match bonus**: 1.4x multiplier when domain's language matches file languages
+- **Identity keywords**: Extracted from domain name + scope, matched against files, file signals, and diff
+- **Trigger keywords**: Domain-specific high-signal terms (e.g., `CORS`, `sqlx::`) scored independently, not diluted by identity keyword count
+- **Title matching**: PR title keywords weighted 8x for identity, 12x for trigger matches
+- **File signal detection**: Language/framework signals from extensions (`_EXT_TO_LANG`), directory names (`_DIR_SIGNALS`), and Python-specific basenames (`pyproject.toml`, `poetry.lock`, etc.)
+- **Minimum relevance threshold**: 15.0 (domains scoring below are excluded)
+- **Expert count cap**: Based on total lines changed (≤300→2, ≤800→3, ≤2000→4, >2000→5)
+
+#### Frontend Components
+
+| Component | File | Description |
+|-----------|------|-------------|
+| `WorkflowEngineView` | `components/engine/WorkflowEngineView.tsx` | Container routing between list, config, detail, gate, domains, and follow-ups views |
+| `WorkflowRunList` | `components/engine/WorkflowRunList.tsx` | Table of instances with status filter bar, "+ New Run", "Expert Domains", "Follow-Ups" actions |
+| `RunConfigPanel` | `components/engine/RunConfigPanel.tsx` | Template card picker with mode badges, agent assignment, PR selection, pipeline preview |
+| `WorkflowRunDetail` | `components/engine/WorkflowRunDetail.tsx` | Two-panel layout: vertical step timeline (left) + content viewer (right) |
+| `StepContentViewer` | `components/engine/StepContentViewer.tsx` | Renders step output by type with collapsible prompt sections, expert domain detail, follow-up views, live agent output |
+| `GateView` | `components/engine/GateView.tsx` | Full-page gate: overview, comparison, synthesis log, questions, domains (per-domain synthesis), publish preview, freshness with staleness indicators |
+| `ReviewComparison` | `components/engine/ReviewComparison.tsx` | Side-by-side Agent A vs Agent B review columns with synthesis classification |
+| `PublishPreview` | `components/engine/PublishPreview.tsx` | Rendered markdown preview of the GitHub comment to be posted |
+| `FindingCard` | `components/engine/FindingCard.tsx` | Individual finding: severity badge, file location, problem, fix, source (A/B/BOTH), classification |
+| `ExpertDomainManager` | `components/engine/ExpertDomainManager.tsx` | Expandable domain list with persona, checklist, anti-patterns, triggers; create/disable/delete custom domains |
+| `FollowUpTracker` | `components/engine/FollowUpTracker.tsx` | Follow-up list with status badges, per-finding resolution table, expandable detail view |
+
+State management via `useWorkflowEngineStore` (Zustand). API client at `api/workflow-engine.ts`.
+
+#### Built-in Templates
+
+| Template | Steps | Description |
+|----------|-------|-------------|
+| Quick Review | PR Select → Prompt Gen → Agent Review | Single-agent, single-pass review |
+| Team Review | PR Select → Prioritize → Prompt Gen → Agent A + Agent B → Synthesis → Freshness → Human Gate → Publish | Dual-agent adversarial review |
+| Self-Review | PR Select → Expert Select → Prompt Gen → Agent A + Agent B → Synthesis → Holistic → Human Gate | Multi-expert deep-dive (local only) |
+| Deep Review | PR Select → Expert Select → Prompt Gen → Agent A + Agent B → Synthesis → Holistic → Human Gate → Publish | Multi-expert deep-dive with publication |
 
 ### Styling
 
@@ -2155,6 +2299,36 @@ Checks if a PR has been reviewed.
 
 ---
 
+### Workflow Engine
+
+**GET** `/api/templates` — List all workflow templates.
+
+**GET** `/api/templates/<id>` — Get a single template with parsed `template` object.
+
+**POST** `/api/templates` — Create a template. Body: `{name, description?, template}`.
+
+**PUT** `/api/templates/<id>` — Update a non-builtin template.
+
+**POST** `/api/templates/<id>/clone` — Clone a template. Body: `{name?}`.
+
+**POST** `/api/templates/<id>/validate` — Validate template structure. Returns `{valid, errors[]}`.
+
+**DELETE** `/api/templates/<id>` — Delete a non-builtin template.
+
+**POST** `/api/workflows/run` — Start a workflow run. Body: `{template_id, repo, config?}`. Returns `{id, status}`.
+
+**GET** `/api/workflows/instances` — List instances. Query: `?repo=owner/repo`.
+
+**GET** `/api/workflows/instances/<id>` — Get instance with steps and artifacts.
+
+**POST** `/api/workflows/instances/<id>/gate` — Gate action. Body: `{action: "approve"|"reject", ...data}`.
+
+**DELETE** `/api/workflows/instances/<id>` — Cancel a running instance.
+
+**GET** `/api/agents` — List registered AI agents.
+
+---
+
 ### Cache Management
 
 **POST** `/api/clear-cache`
@@ -2605,7 +2779,7 @@ The formal JSON Schema specification is available at `backend/services/review_sc
 6. **Review Stats Sampling**: Reviews fetched for a configurable number of PRs (default 250, set via `review_sample_limit` in config.json)
 7. **Claude CLI Required**: Code review feature requires Claude CLI installed and authenticated
 8. **One Review Per PR**: Cannot run multiple concurrent reviews for the same PR
-9. **Active Review Volatility**: In-progress reviews lost if server restarts mid-review (completed reviews are persisted)
+9. **Active Review Volatility**: In-progress reviews lost if server restarts mid-review (completed reviews are persisted). On restart, orphaned agent subprocesses are automatically killed via `pid_tracker.kill_all_tracked()` and their workflow steps marked as failed with a retry prompt
 10. **Fixed Review Output Path**: Reviews always written to hardcoded directory
 11. **Score Extraction Heuristic**: Score parsing relies on regex patterns; unusual formats may not be detected
 12. **Migration One-Time**: Data migration from legacy JSON/markdown runs once; subsequent manual additions to old format not auto-imported
@@ -2663,7 +2837,8 @@ gh-pr-explorer/
 │   │   ├── merge_queue.py          # MergeQueueDB
 │   │   ├── settings.py             # SettingsDB
 │   │   ├── dev_stats.py            # DeveloperStatsDB
-│   │   └── cache_stores.py         # LifecycleCacheDB, WorkflowCacheDB, ContributorTSCacheDB, CodeActivityCacheDB
+│   │   ├── cache_stores.py         # LifecycleCacheDB, WorkflowCacheDB, ContributorTSCacheDB, CodeActivityCacheDB
+│   │   └── workflows.py            # WorkflowDB — CRUD for templates, instances, steps, artifacts, agents
 │   │
 │   ├── services/                   # Business logic layer
 │   │   ├── github_service.py       # gh CLI wrapper: run_command, parse_json, fetch_stats_api
@@ -2690,7 +2865,29 @@ gh-pr-explorer/
 │   │   ├── lifecycle_visualizer.py # Merge time distribution, stale PR detection, pr_table
 │   │   └── responsiveness_visualizer.py  # Reviewer leaderboard, bottleneck detection
 │   │
-│   └── routes/                     # Flask Blueprints (11 blueprints)
+│   ├── agents/                     # Pluggable AI agent backends
+│   │   ├── base.py                 # AgentBackend ABC, AgentHandle, AgentStatus, ReviewArtifact
+│   │   ├── claude_cli.py           # ClaudeCLIAgent — wraps subprocess calls to `claude`
+│   │   ├── openai_api.py           # OpenAIAgent — OpenAI chat completions via httpx
+│   │   └── registry.py             # get_agent(name), list_agents(), agent type registry
+│   │
+│   ├── workflows/                  # Generic workflow engine
+│   │   ├── step_types.py           # StepType enum, @register_step, STEP_REGISTRY
+│   │   ├── executor.py             # StepExecutor ABC, StepResult dataclass
+│   │   ├── runtime.py              # WorkflowRuntime — topo-sort, fan-out, gate pausing
+│   │   ├── seed.py                 # Built-in templates + agents seeded on startup
+│   │   └── executors/              # Step executor implementations (8 executors)
+│   │       ├── __init__.py
+│   │       ├── pr_select.py
+│   │       ├── prioritize.py
+│   │       ├── prompt_generate.py
+│   │       ├── agent_review.py
+│   │       ├── synthesis.py
+│   │       ├── freshness_check.py
+│   │       ├── human_gate.py
+│   │       └── publish.py
+│   │
+│   └── routes/                     # Flask Blueprints (12 blueprints)
 │       ├── __init__.py             # register_blueprints(app)
 │       ├── static_routes.py        # / and /assets/<path>
 │       ├── auth_routes.py          # /api/user, /api/orgs
@@ -2698,6 +2895,7 @@ gh-pr-explorer/
 │       ├── pr_routes.py            # /api/repos/.../prs, prs/divergence
 │       ├── analytics_routes.py     # /api/repos/.../stats, lifecycle, responsiveness, activity, contributors
 │       ├── workflow_routes.py      # /api/repos/.../workflow-runs
+│       ├── workflow_engine_routes.py  # /api/templates, /api/workflows/*, /api/agents
 │       ├── queue_routes.py         # /api/merge-queue CRUD + reorder + notes
 │       ├── review_routes.py        # /api/reviews CRUD + status + inline-comments + check-new-commits
 │       ├── history_routes.py       # /api/review-history list, detail, PR reviews, stats, check
@@ -2706,10 +2904,10 @@ gh-pr-explorer/
 │
 ├── frontend/                       # React + TypeScript frontend
 │   ├── src/
-│   │   ├── api/                    # Type-safe API modules
-│   │   ├── components/             # React components by feature
-│   │   ├── stores/                 # Zustand state management
-│   │   ├── styles/                 # CSS styles
+│   │   ├── api/                    # Type-safe API modules (incl. workflow-engine.ts)
+│   │   ├── components/             # React components by feature (incl. engine/)
+│   │   ├── stores/                 # Zustand state management (incl. useWorkflowEngineStore)
+│   │   ├── styles/                 # CSS styles (incl. workflow-engine.css)
 │   │   ├── types/                  # TypeScript types
 │   │   ├── App.tsx                 # Root component
 │   │   └── main.tsx                # Entry point

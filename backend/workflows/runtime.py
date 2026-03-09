@@ -27,64 +27,196 @@ class WorkflowRuntime:
         self.steps = {s["id"]: s for s in template.get("steps", [])}
         self.edges = template.get("edges", [])
         self.fan_out_groups = template.get("fan_out_groups", [])
+        self._overlay_db_step_configs()
+
+    def _is_cancelled(self) -> bool:
+        from backend.workflows.cancellation import is_cancelled
+        return is_cancelled(self.instance_id)
 
     def execute(self, initial_inputs: dict, instance_config: dict) -> dict:
         """Run the workflow from start to finish (or until a gate pause).
 
         Returns a dict with:
-          - status: 'completed' | 'awaiting_gate' | 'failed'
+          - status: 'completed' | 'awaiting_gate' | 'failed' | 'cancelled'
           - outputs: merged outputs from all completed steps
           - gate_step_id: if paused at a gate, the step that requires human input
           - error: if failed
         """
-        topo_order = self._topological_sort()
+        missing = self._check_executors()
+        if missing:
+            error_msg = (
+                f"Cannot run workflow: missing executors for step types: "
+                f"{', '.join(missing)}. These are Phase 3+ features not yet implemented."
+            )
+            logger.error(error_msg)
+            for step_id, step_def in self.steps.items():
+                if step_def["type"] in missing:
+                    self._update_step_status(step_id, "failed", error=error_msg)
+            return {"status": "failed", "outputs": {}, "error": error_msg}
+
+        levels = self._parallel_levels()
         step_outputs: dict[str, dict] = {}
         all_outputs = dict(initial_inputs)
 
-        for step_id in topo_order:
-            step_def = self.steps[step_id]
-            step_type = step_def["type"]
-            step_config = step_def.get("config", {})
+        for level in levels:
+            if self._is_cancelled():
+                return {"status": "cancelled", "outputs": all_outputs}
 
+            if len(level) == 1:
+                result = self._execute_single_step(
+                    level[0], step_outputs, all_outputs, instance_config
+                )
+                if result is not None:
+                    return result
+            else:
+                result = self._execute_parallel_steps(
+                    level, step_outputs, all_outputs, instance_config
+                )
+                if result is not None:
+                    return result
+
+        return {"status": "completed", "outputs": all_outputs}
+
+    def _execute_single_step(self, step_id: str, step_outputs: dict,
+                              all_outputs: dict, instance_config: dict) -> Optional[dict]:
+        """Run one step. Returns a result dict if the workflow should stop, else None."""
+        step_def = self.steps[step_id]
+        step_type = step_def["type"]
+        step_config = step_def.get("config", {})
+
+        upstream_ids = self._get_upstream(step_id)
+        inputs = dict(all_outputs)
+        for uid in upstream_ids:
+            if uid in step_outputs:
+                self._merge_outputs(inputs, step_outputs[uid])
+
+        self._update_step_status(step_id, "running")
+
+        try:
+            executor_cls = get_executor_class(step_type)
+            enriched_config = {**step_config, "_step_id": step_id}
+            enriched_inst = {**instance_config, "_instance_id": self.instance_id}
+            executor = executor_cls(step_config=enriched_config, instance_config=enriched_inst)
+            result = executor.execute(inputs)
+        except Exception as e:
+            logger.error(f"Step {step_id} ({step_type}) failed: {e}")
+            self._update_step_status(step_id, "failed", error=str(e))
+            return {"status": "failed", "outputs": all_outputs, "error": str(e)}
+
+        if not result.success:
+            self._update_step_status(step_id, "failed", error=result.error)
+            return {"status": "failed", "outputs": all_outputs, "error": result.error}
+
+        if result.awaiting_gate:
+            self._update_step_status(step_id, "awaiting_gate")
+            self._save_gate_payload(step_id, result.gate_payload)
+            return {
+                "status": "awaiting_gate",
+                "outputs": all_outputs,
+                "gate_step_id": step_id,
+                "gate_payload": result.gate_payload,
+            }
+
+        step_outputs[step_id] = result.outputs
+        self._merge_outputs(all_outputs, result.outputs)
+        self._update_step_status(step_id, "completed")
+        self._save_step_outputs(step_id, result.outputs)
+
+        for artifact in result.artifacts:
+            self._save_artifact(step_id, artifact)
+
+        return None
+
+    def _execute_parallel_steps(self, step_ids: list[str], step_outputs: dict,
+                                 all_outputs: dict, instance_config: dict) -> Optional[dict]:
+        """Run multiple steps concurrently. Returns a result dict if workflow should stop, else None."""
+        logger.info(f"Running {len(step_ids)} steps in parallel: {step_ids}")
+
+        per_step_inputs = {}
+        for step_id in step_ids:
             upstream_ids = self._get_upstream(step_id)
             inputs = dict(all_outputs)
             for uid in upstream_ids:
                 if uid in step_outputs:
-                    inputs.update(step_outputs[uid])
+                    self._merge_outputs(inputs, step_outputs[uid])
+            per_step_inputs[step_id] = inputs
 
-            self._update_step_status(step_id, "running")
+        for sid in step_ids:
+            self._update_step_status(sid, "running")
 
-            try:
+        futures = {}
+        with ThreadPoolExecutor(max_workers=len(step_ids)) as pool:
+            for step_id in step_ids:
+                step_def = self.steps[step_id]
+                step_type = step_def["type"]
+                step_config = step_def.get("config", {})
+
                 executor_cls = get_executor_class(step_type)
-                executor = executor_cls(step_config=step_config, instance_config=instance_config)
-                result = executor.execute(inputs)
-            except Exception as e:
-                logger.error(f"Step {step_id} ({step_type}) failed: {e}")
-                self._update_step_status(step_id, "failed", error=str(e))
-                return {"status": "failed", "outputs": all_outputs, "error": str(e)}
+                enriched_config = {**step_config, "_step_id": step_id}
+                enriched_inst = {**instance_config, "_instance_id": self.instance_id}
+                executor = executor_cls(step_config=enriched_config, instance_config=enriched_inst)
 
-            if not result.success:
-                self._update_step_status(step_id, "failed", error=result.error)
-                return {"status": "failed", "outputs": all_outputs, "error": result.error}
+                future = pool.submit(executor.execute, per_step_inputs[step_id])
+                futures[future] = step_id
 
-            if result.awaiting_gate:
-                self._update_step_status(step_id, "awaiting_gate")
-                self._save_gate_payload(step_id, result.gate_payload)
-                return {
-                    "status": "awaiting_gate",
-                    "outputs": all_outputs,
-                    "gate_step_id": step_id,
-                    "gate_payload": result.gate_payload,
-                }
+            early_exit = None
+            completed_step_ids: set[str] = set()
+            for future in as_completed(futures):
+                step_id = futures[future]
+                step_type = self.steps[step_id]["type"]
 
-            step_outputs[step_id] = result.outputs
-            all_outputs.update(result.outputs)
-            self._update_step_status(step_id, "completed")
+                if early_exit is not None:
+                    # Drain remaining futures but don't process results —
+                    # sibling was already signalled to cancel via the
+                    # cancellation registry below.
+                    continue
 
-            for artifact in result.artifacts:
-                self._save_artifact(step_id, artifact)
+                try:
+                    result = future.result()
+                except Exception as e:
+                    logger.error(f"Step {step_id} ({step_type}) failed: {e}")
+                    self._update_step_status(step_id, "failed", error=str(e))
+                    early_exit = {"status": "failed", "outputs": all_outputs, "error": str(e)}
+                    self._cancel_sibling_agents()
+                    continue
 
-        return {"status": "completed", "outputs": all_outputs}
+                if not result.success:
+                    self._update_step_status(step_id, "failed", error=result.error)
+                    early_exit = {"status": "failed", "outputs": all_outputs, "error": result.error}
+                    self._cancel_sibling_agents()
+                    continue
+
+                if result.awaiting_gate:
+                    self._update_step_status(step_id, "awaiting_gate")
+                    self._save_gate_payload(step_id, result.gate_payload)
+                    early_exit = {
+                        "status": "awaiting_gate", "outputs": all_outputs,
+                        "gate_step_id": step_id, "gate_payload": result.gate_payload,
+                    }
+                    self._cancel_sibling_agents()
+                    continue
+
+                completed_step_ids.add(step_id)
+                step_outputs[step_id] = result.outputs
+                self._merge_outputs(all_outputs, result.outputs)
+                self._update_step_status(step_id, "completed")
+                self._save_step_outputs(step_id, result.outputs)
+
+                for artifact in result.artifacts:
+                    self._save_artifact(step_id, artifact)
+
+        if early_exit is not None:
+            # Mark sibling steps that didn't complete as cancelled
+            for sid in step_ids:
+                if sid not in completed_step_ids:
+                    db_status = self._get_step_db_status(sid)
+                    if db_status and db_status not in ("failed", "completed"):
+                        self._update_step_status(
+                            sid, "cancelled",
+                            error="Cancelled: sibling step failed",
+                        )
+
+        return early_exit
 
     def execute_fan_out(self, step_id: str, items: list, inputs: dict, instance_config: dict,
                         max_parallel: int = 4) -> list[StepResult]:
@@ -124,52 +256,142 @@ class WorkflowRuntime:
                           all_outputs: dict, instance_config: dict) -> dict:
         """Resume execution after a human gate decision.
 
-        Continues from the step after the gate.
+        Uses _parallel_levels so review_a/review_b run concurrently.
+        If gate_decision contains edited prompts, they replace the originals
+        so downstream steps (review agents) see the user-edited versions.
         """
-        all_outputs.update(gate_decision)
-        topo_order = self._topological_sort()
+        if "prompts" in gate_decision:
+            all_outputs["prompts"] = gate_decision["prompts"]
+        self._merge_outputs(all_outputs, gate_decision)
 
+        self._update_step_status(gate_step_id, "completed")
+
+        step_outputs: dict[str, dict] = {}
+        if self.db:
+            for row in self.db.get_steps(self.instance_id):
+                if row["status"] == "completed" and row.get("outputs_json"):
+                    try:
+                        step_outputs[row["step_id"]] = json.loads(row["outputs_json"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+        levels = self._parallel_levels()
         past_gate = False
-        for step_id in topo_order:
-            if step_id == gate_step_id:
-                self._update_step_status(step_id, "completed")
+
+        for level in levels:
+            if gate_step_id in level:
                 past_gate = True
                 continue
             if not past_gate:
                 continue
+            if self._is_cancelled():
+                return {"status": "cancelled", "outputs": all_outputs}
 
-            step_def = self.steps[step_id]
-            step_type = step_def["type"]
-            step_config = step_def.get("config", {})
-
-            try:
-                executor_cls = get_executor_class(step_type)
-                executor = executor_cls(step_config=step_config, instance_config=instance_config)
-                result = executor.execute(all_outputs)
-            except Exception as e:
-                self._update_step_status(step_id, "failed", error=str(e))
-                return {"status": "failed", "outputs": all_outputs, "error": str(e)}
-
-            if not result.success:
-                self._update_step_status(step_id, "failed", error=result.error)
-                return {"status": "failed", "outputs": all_outputs, "error": result.error}
-
-            if result.awaiting_gate:
-                self._update_step_status(step_id, "awaiting_gate")
-                return {
-                    "status": "awaiting_gate",
-                    "outputs": all_outputs,
-                    "gate_step_id": step_id,
-                    "gate_payload": result.gate_payload,
-                }
-
-            all_outputs.update(result.outputs)
-            self._update_step_status(step_id, "completed")
-
-            for artifact in result.artifacts:
-                self._save_artifact(step_id, artifact)
+            if len(level) == 1:
+                result = self._execute_single_step(
+                    level[0], step_outputs, all_outputs, instance_config
+                )
+                if result is not None:
+                    return result
+            else:
+                result = self._execute_parallel_steps(
+                    level, step_outputs, all_outputs, instance_config
+                )
+                if result is not None:
+                    return result
 
         return {"status": "completed", "outputs": all_outputs}
+
+    def retry_from_step(self, retry_step_id: str, all_outputs: dict,
+                        instance_config: dict) -> dict:
+        """Re-execute from a given step (and all downstream steps).
+
+        Resets the target step and all its successors to pending, then
+        runs them using _parallel_levels, skipping levels before the
+        target step.
+        """
+        downstream = self._get_downstream_inclusive(retry_step_id)
+        if self.db:
+            self.db.reset_steps(self.instance_id, downstream)
+
+        step_outputs: dict[str, dict] = {}
+        if self.db:
+            for row in self.db.get_steps(self.instance_id):
+                sid = row["step_id"]
+                if sid not in downstream and row["status"] == "completed" and row.get("outputs_json"):
+                    try:
+                        step_outputs[sid] = json.loads(row["outputs_json"])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+        levels = self._parallel_levels()
+        reached = False
+
+        for level in levels:
+            if retry_step_id in level:
+                reached = True
+            if not reached:
+                continue
+            if self._is_cancelled():
+                return {"status": "cancelled", "outputs": all_outputs}
+
+            if len(level) == 1:
+                result = self._execute_single_step(
+                    level[0], step_outputs, all_outputs, instance_config
+                )
+                if result is not None:
+                    return result
+            else:
+                result = self._execute_parallel_steps(
+                    level, step_outputs, all_outputs, instance_config
+                )
+                if result is not None:
+                    return result
+
+        return {"status": "completed", "outputs": all_outputs}
+
+    def _get_downstream_inclusive(self, start_id: str) -> list[str]:
+        """Return start_id plus all steps reachable from it (BFS)."""
+        adjacency: dict[str, list[str]] = {}
+        for edge in self.edges:
+            adjacency.setdefault(edge["from"], []).append(edge["to"])
+
+        visited = set()
+        queue = [start_id]
+        while queue:
+            node = queue.pop(0)
+            if node in visited:
+                continue
+            visited.add(node)
+            for neighbor in adjacency.get(node, []):
+                queue.append(neighbor)
+        return sorted(visited)
+
+    def _overlay_db_step_configs(self):
+        """Merge per-step configs from DB rows (which include run-time overrides)
+        on top of the template defaults."""
+        if not self.db:
+            return
+        try:
+            db_steps = self.db.get_steps(self.instance_id)
+            for row in db_steps:
+                sid = row["step_id"]
+                if sid in self.steps and row.get("step_config_json"):
+                    db_config = json.loads(row["step_config_json"])
+                    self.steps[sid]["config"] = db_config
+        except Exception as e:
+            logger.warning(f"Could not overlay DB step configs: {e}")
+
+    def _check_executors(self) -> list[str]:
+        """Check that all step types in this workflow have registered executors.
+        Returns list of missing step type names (empty = all good)."""
+        from backend.workflows.step_types import STEP_REGISTRY
+        missing = []
+        for step_def in self.steps.values():
+            st = step_def["type"]
+            if st not in STEP_REGISTRY and st not in missing:
+                missing.append(st)
+        return missing
 
     def _topological_sort(self) -> list[str]:
         """Topological sort of the step graph via Kahn's algorithm."""
@@ -201,8 +423,79 @@ class WorkflowRuntime:
 
         return result
 
+    def _parallel_levels(self) -> list[list[str]]:
+        """Group steps into execution levels. Steps in the same level share no
+        dependency on each other and can run concurrently."""
+        in_degree = defaultdict(int)
+        adjacency = defaultdict(list)
+        all_step_ids = set(self.steps.keys())
+
+        for edge in self.edges:
+            src, dst = edge["from"], edge["to"]
+            adjacency[src].append(dst)
+            in_degree[dst] += 1
+
+        for sid in all_step_ids:
+            if sid not in in_degree:
+                in_degree[sid] = 0
+
+        levels: list[list[str]] = []
+        queue = [sid for sid in all_step_ids if in_degree[sid] == 0]
+
+        visited = 0
+        while queue:
+            levels.append(sorted(queue))
+            visited += len(queue)
+            next_queue = []
+            for node in queue:
+                for neighbor in adjacency[node]:
+                    in_degree[neighbor] -= 1
+                    if in_degree[neighbor] == 0:
+                        next_queue.append(neighbor)
+            queue = next_queue
+
+        if visited != len(all_step_ids):
+            raise ValueError(
+                f"Workflow template contains a cycle: {len(all_step_ids) - visited} "
+                f"steps are unreachable"
+            )
+
+        return levels
+
+    _MERGEABLE_LIST_KEYS = {"reviews", "findings", "followup_results"}
+
+    @staticmethod
+    def _merge_outputs(target: dict, source: dict):
+        """Merge source outputs into target, concatenating lists only for allowlisted keys."""
+        for key, value in source.items():
+            if (key in WorkflowRuntime._MERGEABLE_LIST_KEYS
+                    and key in target
+                    and isinstance(target[key], list)
+                    and isinstance(value, list)):
+                target[key] = target[key] + value
+            else:
+                target[key] = value
+
     def _get_upstream(self, step_id: str) -> list[str]:
         return [e["from"] for e in self.edges if e["to"] == step_id]
+
+    def _cancel_sibling_agents(self):
+        """Signal instance cancellation so running sibling agent polls exit early."""
+        from backend.workflows.cancellation import cancel as cancel_instance
+        cancel_instance(self.instance_id)
+
+    def _get_step_db_status(self, step_id: str) -> Optional[str]:
+        """Read current step status from DB (avoids overwriting a step already marked failed)."""
+        if not self.db:
+            return None
+        try:
+            rows = self.db.get_steps(self.instance_id)
+            for row in rows:
+                if row.get("step_id") == step_id:
+                    return row.get("status")
+            return None
+        except Exception:
+            return None
 
     def _update_step_status(self, step_id: str, status: str, error: Optional[str] = None):
         if self.db:
@@ -218,12 +511,24 @@ class WorkflowRuntime:
             except Exception as e:
                 logger.warning(f"Failed to save artifact: {e}")
 
+    def _save_step_outputs(self, step_id: str, outputs: dict):
+        if self.db and outputs:
+            try:
+                self.db.save_step_outputs(self.instance_id, step_id, outputs)
+            except Exception as e:
+                logger.warning(f"Failed to save step outputs: {e}")
+
     def _save_gate_payload(self, step_id: str, payload: Optional[dict]):
         if self.db and payload:
             try:
                 self.db.save_gate_payload(self.instance_id, step_id, payload)
             except Exception as e:
                 logger.warning(f"Failed to save gate payload: {e}")
+
+
+def merge_outputs(target: dict, source: dict):
+    """Module-level alias for WorkflowRuntime._merge_outputs."""
+    WorkflowRuntime._merge_outputs(target, source)
 
 
 def validate_template(template: dict) -> list[str]:
@@ -259,5 +564,26 @@ def validate_template(template: dict) -> list[str]:
     if len(steps) > 1 and orphans:
         for orphan in orphans:
             errors.append(f"Step '{orphan}' is not connected to any other step")
+
+    if edges:
+        in_degree = defaultdict(int)
+        adjacency = defaultdict(list)
+        for edge in edges:
+            adjacency[edge["from"]].append(edge["to"])
+            in_degree[edge["to"]] += 1
+        for sid in step_ids:
+            if sid not in in_degree:
+                in_degree[sid] = 0
+        queue = deque(sid for sid in step_ids if in_degree[sid] == 0)
+        visited = 0
+        while queue:
+            node = queue.popleft()
+            visited += 1
+            for neighbor in adjacency[node]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
+        if visited != len(step_ids):
+            errors.append("Template contains a cycle — some steps are unreachable")
 
     return errors

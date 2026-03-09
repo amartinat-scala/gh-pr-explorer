@@ -58,6 +58,13 @@ class AgentBackend(ABC):
     def get_output(self, handle: AgentHandle) -> ReviewArtifact:
         """Retrieve the finished review artifact. Only valid after COMPLETED status."""
 
+    def get_live_output(self, handle: AgentHandle) -> str:
+        """Return partial stdout captured so far from a running agent. Empty if not supported."""
+        return ""
+
     def cancel(self, handle: AgentHandle) -> bool:
         """Attempt to cancel a running review. Returns True if cancelled."""
         return False
+
+    def cleanup(self, handle: AgentHandle) -> None:
+        """Release resources (file descriptors, process entries) after a review completes or is cancelled."""

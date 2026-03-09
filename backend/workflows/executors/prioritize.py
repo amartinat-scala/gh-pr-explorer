@@ -54,6 +54,21 @@ class PrioritizeExecutor(StepExecutor):
                 "skipped_prs": skipped,
                 "batch_size": len(batch),
             },
+            artifacts=[{
+                "type": "scored_prs",
+                "data": {
+                    "prs": [
+                        {"number": p.get("number"), "title": p.get("title"),
+                         "priority_score": p.get("priority_score"),
+                         "priority_level": p.get("priority_level"),
+                         "priority_rationale": p.get("priority_rationale")}
+                        for p in batch
+                    ],
+                    "skipped": skipped,
+                    "total_scored": len(scored),
+                    "batch_size": len(batch),
+                },
+            }],
         )
 
     def _score_pr(self, pr: dict, code_owners: dict) -> tuple[float, list[str]]:
@@ -134,12 +149,14 @@ class PrioritizeExecutor(StepExecutor):
         return 3
 
     def _get_skip_list(self) -> dict[int, str]:
+        repo = self.instance_config.get("repo", "")
         try:
             from backend.database import get_workflow_db
             db = get_workflow_db()
             with db.db.connection() as conn:
                 rows = conn.execute(
-                    "SELECT pr_number, reason FROM skip_list"
+                    "SELECT pr_number, reason FROM skip_list WHERE repo = ?",
+                    (repo,),
                 ).fetchall()
                 return {r["pr_number"]: r["reason"] for r in rows}
         except Exception:

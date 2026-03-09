@@ -9,6 +9,9 @@ venv/
 
 # Database
 pr_explorer.db
+pr_explorer.db-shm
+pr_explorer.db-wal
+pr_explorer.db-journal
 
 # IDE
 .idea/
@@ -24,6 +27,9 @@ node_modules/
 frontend/dist/
 frontend/.env
 frontend/.vite/
+
+# Generated review files
+reviews/
 
 # Logs
 gh-pr-explorer.log

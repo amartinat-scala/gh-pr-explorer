@@ -20,6 +20,23 @@ export interface WorkflowStep {
   started_at?: string
   completed_at?: string
   error_message?: string
+  outputs_json?: string | Record<string, unknown> | null
+  step_config_json?: string | null
+  agent_id?: number | null
+  inputs_json?: string | null
+}
+
+/**
+ * Safely parse outputs_json which may be a string, object, or null.
+ */
+export function parseContent(raw: string | Record<string, unknown> | null | undefined): Record<string, unknown> | null {
+  if (!raw) return null
+  if (typeof raw === 'object') return raw
+  try {
+    return JSON.parse(raw)
+  } catch {
+    return null
+  }
 }
 
 export interface WorkflowArtifact {
@@ -29,6 +46,7 @@ export interface WorkflowArtifact {
   pr_number?: number
   artifact_type: string
   file_path?: string
+  content_json?: string | Record<string, unknown> | null
   created_at: string
 }
 
@@ -100,9 +118,9 @@ export async function getInstance(id: number): Promise<WorkflowInstance> {
 
 export async function gateAction(
   instanceId: number,
-  action: 'approve' | 'reject',
+  action: 'approve' | 'reject' | 'revise',
   data?: Record<string, unknown>
-): Promise<{ ok: boolean; status: string }> {
+): Promise<{ ok: boolean; status: string; retrying_from?: string; iteration?: number }> {
   return api.post(`/workflows/instances/${instanceId}/gate`, { action, ...data })
 }
 
@@ -112,4 +130,119 @@ export async function cancelInstance(id: number): Promise<{ ok: boolean }> {
 
 export async function listAgents(): Promise<Agent[]> {
   return api.get<Agent[]>('/agents')
+}
+
+export async function getAvailableStepTypes(): Promise<{ available: string[] }> {
+  return api.get<{ available: string[] }>('/step-types')
+}
+
+export async function getStepLiveOutput(instanceId: number, stepId: string): Promise<string> {
+  const res = await api.get<{ output: string }>(`/workflows/instances/${instanceId}/steps/${stepId}/live`)
+  return res.output
+}
+
+export async function retryStep(instanceId: number, stepId: string, clearFeedback = false): Promise<{ ok: boolean; status: string }> {
+  return api.post(`/workflows/instances/${instanceId}/steps/${stepId}/retry`, { clear_feedback: clearFeedback })
+}
+
+export async function getInstanceFeedback(instanceId: number): Promise<{ human_feedback: Array<{ gate_step_id: string; retry_target: string; feedback: string; iteration: number }> }> {
+  return api.get(`/workflows/instances/${instanceId}/feedback`)
+}
+
+export async function clearInstanceFeedback(instanceId: number): Promise<{ ok: boolean }> {
+  return api.delete(`/workflows/instances/${instanceId}/feedback`)
+}
+
+export function getStepDownloadUrl(instanceId: number, stepId: string, format: 'md' | 'json' = 'md'): string {
+  return `/api/workflows/instances/${instanceId}/steps/${stepId}/download?format=${format}`
+}
+
+// --- Per-Domain Agent Tracking ---
+
+export interface AgentDomainInfo {
+  status: string
+  agent_name: string
+  started_at: number | null
+  completed_at?: number | null
+  pid?: number | null
+  error?: string | null
+  review_md?: string | null
+}
+
+export async function getAgentDomains(instanceId: number, stepId: string): Promise<Record<string, AgentDomainInfo>> {
+  return api.get<Record<string, AgentDomainInfo>>(`/workflows/instances/${instanceId}/steps/${stepId}/agents`)
+}
+
+export async function cancelAgentDomain(instanceId: number, stepId: string, domain: string): Promise<{ ok: boolean }> {
+  return api.post(`/workflows/instances/${instanceId}/steps/${stepId}/agents/${encodeURIComponent(domain)}/cancel`, {})
+}
+
+export async function rerunAgentDomain(instanceId: number, stepId: string, domain: string): Promise<{ ok: boolean }> {
+  return api.post(`/workflows/instances/${instanceId}/steps/${stepId}/agents/${encodeURIComponent(domain)}/rerun`, {})
+}
+
+// --- Expert Domains ---
+
+export interface ExpertDomain {
+  id: number
+  domain_id: string
+  display_name: string
+  persona: string
+  scope: string
+  triggers: { file_patterns: string[]; keywords: string[] }
+  checklist: string[]
+  anti_patterns: string[]
+  is_builtin: boolean
+  is_active: boolean
+}
+
+export async function listExpertDomains(): Promise<ExpertDomain[]> {
+  return api.get<ExpertDomain[]>('/expert-domains')
+}
+
+export async function createExpertDomain(data: Partial<ExpertDomain>): Promise<{ id: number }> {
+  return api.post('/expert-domains', data)
+}
+
+export async function updateExpertDomain(domainId: string, data: Partial<ExpertDomain>): Promise<{ ok: boolean }> {
+  return api.put(`/expert-domains/${domainId}`, data)
+}
+
+export async function deleteExpertDomain(domainId: string): Promise<{ ok: boolean }> {
+  return api.delete(`/expert-domains/${domainId}`)
+}
+
+// --- Follow-ups ---
+
+export interface FollowupFinding {
+  id: number
+  finding_id: string
+  original_text: string
+  severity: string
+  status: string
+  author_response?: string
+}
+
+export interface ReviewFollowup {
+  id: number
+  instance_id: number
+  pr_number: number
+  repo: string
+  source_run_id: number
+  verdict: string
+  published_at: string
+  review_sha: string
+  status: string
+  last_checked: string
+  notes?: string
+  findings?: FollowupFinding[]
+}
+
+export async function listFollowups(repo?: string): Promise<ReviewFollowup[]> {
+  const params = repo ? `?repo=${encodeURIComponent(repo)}` : ''
+  return api.get<ReviewFollowup[]>(`/followups${params}`)
+}
+
+export async function getFollowup(id: number): Promise<ReviewFollowup> {
+  return api.get<ReviewFollowup>(`/followups/${id}`)
 }

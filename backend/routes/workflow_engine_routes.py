@@ -4,10 +4,10 @@ import json
 import logging
 import threading
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response
 
 from backend.database import get_workflow_db
-from backend.workflows.runtime import WorkflowRuntime, validate_template
+from backend.workflows.runtime import WorkflowRuntime, validate_template, merge_outputs
 
 logger = logging.getLogger(__name__)
 
@@ -140,12 +140,19 @@ def create_instance():
         config_json=config,
     )
 
+    step_overrides = config.get("step_overrides", {})
+    agent_overrides = config.get("agent_overrides", {})
     for step in template["template"].get("steps", []):
+        step_config = dict(step.get("config", {}))
+        if step["id"] in step_overrides:
+            step_config.update(step_overrides[step["id"]])
+        if step["id"] in agent_overrides:
+            step_config["agent"] = agent_overrides[step["id"]]
         db.create_step(
             instance_id=instance_id,
             step_id=step["id"],
             step_type=step["type"],
-            step_config=step.get("config", {}),
+            step_config=step_config,
         )
 
     # Ensure executors are registered
@@ -184,8 +191,28 @@ def get_instance(instance_id):
     return jsonify(instance)
 
 
+_gate_locks: dict[int, threading.Lock] = {}
+_gate_locks_lock = threading.Lock()
+
+def _get_gate_lock(instance_id: int) -> threading.Lock:
+    with _gate_locks_lock:
+        if instance_id not in _gate_locks:
+            _gate_locks[instance_id] = threading.Lock()
+        return _gate_locks[instance_id]
+
+
 @workflow_engine_bp.route("/api/workflows/instances/<int:instance_id>/gate", methods=["POST"])
 def gate_action(instance_id):
+    lock = _get_gate_lock(instance_id)
+    if not lock.acquire(blocking=False):
+        return jsonify({"error": "Gate action already in progress"}), 409
+    try:
+        return _gate_action_inner(instance_id)
+    finally:
+        lock.release()
+
+
+def _gate_action_inner(instance_id):
     db = get_workflow_db()
     instance = db.get_instance(instance_id)
     if not instance:
@@ -197,20 +224,89 @@ def gate_action(instance_id):
     action = data.get("action", "approve")
 
     if action == "reject":
+        reason = data.get("reason", "Rejected by user")
+        steps = db.get_steps(instance_id)
+        for step in steps:
+            if step["status"] == "awaiting_gate":
+                db.update_step_status(instance_id, step["step_id"], "failed",
+                                      error=f"Gate rejected: {reason}")
+            elif step["status"] == "running":
+                db.update_step_status(instance_id, step["step_id"], "failed",
+                                      error="Cancelled: workflow rejected")
         db.update_instance_status(instance_id, "cancelled")
-        return jsonify({"ok": True, "status": "cancelled"})
+        return jsonify({"ok": True, "status": "cancelled", "reason": reason})
 
     template_data = db.get_template(instance["template_id"])
     if not template_data:
         return jsonify({"error": "Template not found"}), 500
 
+    if action == "revise":
+        feedback_text = data.get("feedback", "").strip()
+        if not feedback_text:
+            return jsonify({"error": "Feedback text is required for revise"}), 400
+
+        steps = db.get_steps(instance_id)
+        gate_step = next((s for s in steps if s["status"] == "awaiting_gate"), None)
+        if not gate_step:
+            return jsonify({"error": "No gate step awaiting action"}), 400
+
+        step_config = json.loads(gate_step.get("step_config_json") or "{}")
+        retry_target = step_config.get("retry_target")
+
+        if not retry_target:
+            for edge in template_data["template"].get("edges", []):
+                if edge["to"] == gate_step["step_id"]:
+                    retry_target = edge["from"]
+                    break
+        if not retry_target:
+            return jsonify({"error": "Cannot determine retry target for this gate"}), 400
+
+        config = json.loads(instance.get("config_json") or "{}")
+        fb_list = config.setdefault("human_feedback", [])
+        iteration = len([f for f in fb_list
+                         if f.get("gate_step_id") == gate_step["step_id"]]) + 1
+        fb_list.append({
+            "gate_step_id": gate_step["step_id"],
+            "retry_target": retry_target,
+            "feedback": feedback_text,
+            "iteration": iteration,
+        })
+        db.update_instance_config(instance_id, config)
+
+        db.update_step_status(instance_id, gate_step["step_id"], "failed",
+                              error=f"Revised: {feedback_text[:100]}")
+
+        inst_lock = _get_instance_lock(instance_id)
+        if not inst_lock.acquire(blocking=False):
+            return jsonify({"error": "Another operation is already running for this instance"}), 409
+        db.update_instance_status(instance_id, "running")
+
+        refreshed_instance = db.get_instance(instance_id)
+
+        def _guarded_revise():
+            try:
+                _retry_from_step(instance_id, template_data["template"],
+                                 refreshed_instance or instance, retry_target)
+            finally:
+                inst_lock.release()
+
+        thread = threading.Thread(target=_guarded_revise, daemon=True)
+        thread.start()
+        return jsonify({"ok": True, "status": "running",
+                        "retrying_from": retry_target, "iteration": iteration})
+
+    inst_lock = _get_instance_lock(instance_id)
+    if not inst_lock.acquire(blocking=False):
+        return jsonify({"error": "Another operation is already running for this instance"}), 409
     db.update_instance_status(instance_id, "running")
 
-    thread = threading.Thread(
-        target=_resume_workflow,
-        args=(instance_id, template_data["template"], instance, data),
-        daemon=True,
-    )
+    def _guarded_resume():
+        try:
+            _resume_workflow(instance_id, template_data["template"], instance, data)
+        finally:
+            inst_lock.release()
+
+    thread = threading.Thread(target=_guarded_resume, daemon=True)
     thread.start()
 
     return jsonify({"ok": True, "status": "running"})
@@ -222,7 +318,128 @@ def cancel_instance(instance_id):
     instance = db.get_instance(instance_id)
     if not instance:
         return jsonify({"error": "Instance not found"}), 404
+    from backend.workflows.cancellation import cancel as cancel_running
+    cancel_running(instance_id)
+    steps = db.get_steps(instance_id)
+    for step in steps:
+        if step["status"] in ("running", "awaiting_gate"):
+            db.update_step_status(instance_id, step["step_id"], "cancelled",
+                                  error="Cancelled by user")
     db.update_instance_status(instance_id, "cancelled")
+    return jsonify({"ok": True})
+
+
+@workflow_engine_bp.route("/api/workflows/instances/<int:instance_id>/steps/<step_id>/live", methods=["GET"])
+def get_step_live_output(instance_id, step_id):
+    from backend.workflows.executors.agent_review import get_agent_live_output
+    text = get_agent_live_output(instance_id, step_id)
+    return jsonify({"output": text})
+
+
+@workflow_engine_bp.route("/api/workflows/instances/<int:instance_id>/steps/<step_id>/retry", methods=["POST"])
+def retry_step(instance_id, step_id):
+    """Retry a workflow from a given step, re-executing it and all downstream steps."""
+    db = get_workflow_db()
+    instance = db.get_instance(instance_id)
+    if not instance:
+        return jsonify({"error": "Instance not found"}), 404
+
+    steps = db.get_steps(instance_id)
+    target = next((s for s in steps if s["step_id"] == step_id), None)
+    if not target:
+        return jsonify({"error": f"Step '{step_id}' not found"}), 404
+
+    if target["status"] == "running":
+        return jsonify({"error": "Step is currently running"}), 400
+    if instance["status"] == "running":
+        return jsonify({"error": "Instance is already running"}), 409
+
+    template_data = db.get_template(instance["template_id"])
+    if not template_data:
+        return jsonify({"error": "Template not found"}), 500
+
+    data = request.get_json(silent=True) or {}
+    clear_feedback = data.get("clear_feedback", False)
+    if clear_feedback:
+        _clear_feedback_for_step(db, instance_id, instance, step_id, template_data["template"])
+
+    lock = _get_instance_lock(instance_id)
+    if not lock.acquire(blocking=False):
+        return jsonify({"error": "Another operation is already running for this instance"}), 409
+    db.update_instance_status(instance_id, "running")
+
+    refreshed = db.get_instance(instance_id) or instance
+
+    def _guarded_retry():
+        try:
+            _retry_from_step(instance_id, template_data["template"], refreshed, step_id)
+        finally:
+            lock.release()
+
+    thread = threading.Thread(target=_guarded_retry, daemon=True)
+    thread.start()
+
+    return jsonify({"ok": True, "status": "running", "retrying_from": step_id})
+
+
+@workflow_engine_bp.route(
+    "/api/workflows/instances/<int:instance_id>/feedback", methods=["GET"]
+)
+def get_instance_feedback(instance_id):
+    """Return current human feedback entries for this instance."""
+    db = get_workflow_db()
+    instance = db.get_instance(instance_id)
+    if not instance:
+        return jsonify({"error": "Instance not found"}), 404
+    config = json.loads(instance.get("config_json") or "{}")
+    return jsonify({"human_feedback": config.get("human_feedback", [])})
+
+
+@workflow_engine_bp.route(
+    "/api/workflows/instances/<int:instance_id>/feedback", methods=["DELETE"]
+)
+def clear_instance_feedback(instance_id):
+    """Clear all human feedback from this instance's config."""
+    db = get_workflow_db()
+    instance = db.get_instance(instance_id)
+    if not instance:
+        return jsonify({"error": "Instance not found"}), 404
+    config = json.loads(instance.get("config_json") or "{}")
+    removed = config.pop("human_feedback", [])
+    db.update_instance_config(instance_id, config)
+    return jsonify({"ok": True, "removed_count": len(removed)})
+
+
+@workflow_engine_bp.route(
+    "/api/workflows/instances/<int:instance_id>/steps/<step_id>/agents", methods=["GET"]
+)
+def get_step_agents(instance_id, step_id):
+    from backend.workflows.executors.agent_review import get_agent_domains
+    domains = get_agent_domains(instance_id, step_id)
+    return jsonify(domains)
+
+
+@workflow_engine_bp.route(
+    "/api/workflows/instances/<int:instance_id>/steps/<step_id>/agents/<domain>/cancel",
+    methods=["POST"],
+)
+def cancel_step_agent(instance_id, step_id, domain):
+    from backend.workflows.executors.agent_review import cancel_agent_domain
+    ok = cancel_agent_domain(instance_id, step_id, domain)
+    if not ok:
+        return jsonify({"error": "Agent not running or not found"}), 400
+    return jsonify({"ok": True})
+
+
+@workflow_engine_bp.route(
+    "/api/workflows/instances/<int:instance_id>/steps/<step_id>/agents/<domain>/rerun",
+    methods=["POST"],
+)
+def rerun_step_agent(instance_id, step_id, domain):
+    from backend.workflows.executors.agent_review import rerun_agent_domain
+    ok = rerun_agent_domain(instance_id, step_id, domain)
+    if not ok:
+        return jsonify({"error": "Cannot rerun: agent is still running or domain not found"}), 400
     return jsonify({"ok": True})
 
 
@@ -235,9 +452,116 @@ def list_agents():
     return jsonify(agents)
 
 
+@workflow_engine_bp.route("/api/step-types", methods=["GET"])
+def list_step_types():
+    import backend.workflows.executors  # noqa: F401
+    from backend.workflows.step_types import STEP_REGISTRY
+    return jsonify({"available": list(STEP_REGISTRY.keys())})
+
+
+# --- Expert Domains ---
+
+@workflow_engine_bp.route("/api/expert-domains", methods=["GET"])
+def list_expert_domains():
+    db = get_workflow_db()
+    active_only = request.args.get("active_only", "true").lower() != "false"
+    domains = db.list_expert_domains(active_only=active_only)
+    return jsonify(domains)
+
+
+@workflow_engine_bp.route("/api/expert-domains", methods=["POST"])
+def create_expert_domain():
+    data = request.get_json()
+    if not data or "domain_id" not in data:
+        return jsonify({"error": "domain_id is required"}), 400
+    db = get_workflow_db()
+    try:
+        domain_id = db.create_expert_domain(
+            domain_id=data["domain_id"],
+            display_name=data.get("display_name", data["domain_id"]),
+            persona=data.get("persona", ""),
+            scope=data.get("scope", ""),
+            triggers=data.get("triggers", {"file_patterns": [], "keywords": []}),
+            checklist=data.get("checklist", []),
+            anti_patterns=data.get("anti_patterns", []),
+            is_builtin=False,
+        )
+        return jsonify({"id": domain_id}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+
+@workflow_engine_bp.route("/api/expert-domains/<domain_id>", methods=["PUT"])
+def update_expert_domain(domain_id):
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Request body required"}), 400
+    db = get_workflow_db()
+    existing = db.get_expert_domain(domain_id)
+    if not existing:
+        return jsonify({"error": "Domain not found"}), 404
+    db.update_expert_domain(domain_id, **data)
+    return jsonify({"ok": True})
+
+
+@workflow_engine_bp.route("/api/expert-domains/<domain_id>", methods=["DELETE"])
+def delete_expert_domain(domain_id):
+    db = get_workflow_db()
+    existing = db.get_expert_domain(domain_id)
+    if not existing:
+        return jsonify({"error": "Domain not found"}), 404
+    if existing.get("is_builtin"):
+        return jsonify({"error": "Cannot delete built-in domains"}), 403
+    db.delete_expert_domain(domain_id)
+    return jsonify({"ok": True})
+
+
+# --- Follow-ups ---
+
+@workflow_engine_bp.route("/api/followups", methods=["GET"])
+def list_followups():
+    db = get_workflow_db()
+    repo = request.args.get("repo")
+    status = request.args.get("status")
+    followups = db.list_followups(repo=repo, status=status)
+    for fu in followups:
+        fu["findings"] = db.get_followup_findings(fu["id"])
+    return jsonify(followups)
+
+
+@workflow_engine_bp.route("/api/followups/<int:followup_id>", methods=["GET"])
+def get_followup(followup_id):
+    db = get_workflow_db()
+    fu = db.get_followup(followup_id)
+    if not fu:
+        return jsonify({"error": "Follow-up not found"}), 404
+    fu["findings"] = db.get_followup_findings(followup_id)
+    return jsonify(fu)
+
+
 # --- Background execution ---
 
+_instance_locks: dict[int, threading.Lock] = {}
+_instance_locks_lock = threading.Lock()
+
+
+def _get_instance_lock(instance_id: int) -> threading.Lock:
+    with _instance_locks_lock:
+        if instance_id not in _instance_locks:
+            _instance_locks[instance_id] = threading.Lock()
+        return _instance_locks[instance_id]
+
+
+def _set_terminal_status(db, instance_id: int, status: str):
+    """Set final instance status, but never overwrite 'cancelled'."""
+    current = db.get_instance(instance_id)
+    if current and current["status"] == "cancelled":
+        return
+    db.update_instance_status(instance_id, status)
+
+
 def _run_workflow(instance_id: int, template: dict, repo: str, config: dict):
+    from backend.workflows.cancellation import clear as cancel_clear
     db = get_workflow_db()
     db.update_instance_status(instance_id, "running")
     try:
@@ -246,13 +570,17 @@ def _run_workflow(instance_id: int, template: dict, repo: str, config: dict):
             initial_inputs={"repo": repo},
             instance_config={"repo": repo, **config},
         )
-        db.update_instance_status(instance_id, result["status"])
+        _set_terminal_status(db, instance_id, result["status"])
     except Exception as e:
         logger.error(f"Workflow instance {instance_id} failed: {e}")
-        db.update_instance_status(instance_id, "failed")
+        _set_terminal_status(db, instance_id, "failed")
+    finally:
+        cancel_clear(instance_id)
 
 
 def _resume_workflow(instance_id: int, template: dict, instance: dict, gate_decision: dict):
+    import backend.workflows.executors  # noqa: F401
+    from backend.workflows.cancellation import clear as cancel_clear
     db = get_workflow_db()
     try:
         steps = db.get_steps(instance_id)
@@ -264,15 +592,197 @@ def _resume_workflow(instance_id: int, template: dict, instance: dict, gate_deci
             db.update_instance_status(instance_id, "failed")
             return
 
+        all_outputs = {"repo": instance.get("repo", "")}
+        for s in steps:
+            if s["status"] == "completed" and s.get("outputs_json"):
+                try:
+                    step_out = json.loads(s["outputs_json"])
+                    merge_outputs(all_outputs, step_out)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
         runtime = WorkflowRuntime(template, instance_id, db_accessor=db)
         config = json.loads(instance.get("config_json") or "{}")
         result = runtime.resume_after_gate(
             gate_step_id=gate_step["step_id"],
             gate_decision=gate_decision,
-            all_outputs={"repo": instance.get("repo", "")},
+            all_outputs=all_outputs,
             instance_config={"repo": instance.get("repo", ""), **config},
         )
-        db.update_instance_status(instance_id, result["status"])
+        _set_terminal_status(db, instance_id, result["status"])
     except Exception as e:
         logger.error(f"Workflow resume for instance {instance_id} failed: {e}")
-        db.update_instance_status(instance_id, "failed")
+        _set_terminal_status(db, instance_id, "failed")
+    finally:
+        cancel_clear(instance_id)
+
+
+def _clear_feedback_for_step(db, instance_id: int, instance: dict,
+                             step_id: str, template: dict):
+    """Remove human_feedback entries whose retry_target is the retried step or downstream."""
+    config = json.loads(instance.get("config_json") or "{}")
+    fb_list = config.get("human_feedback", [])
+    if not fb_list:
+        return
+    runtime = WorkflowRuntime(template, instance_id, db_accessor=db)
+    downstream = runtime._get_downstream_inclusive(step_id)
+    kept = [fb for fb in fb_list if fb.get("retry_target") not in downstream]
+    if len(kept) < len(fb_list):
+        logger.info(f"Cleared {len(fb_list) - len(kept)} stale feedback entries for retry from {step_id}")
+        if kept:
+            config["human_feedback"] = kept
+        else:
+            config.pop("human_feedback", None)
+        db.update_instance_config(instance_id, config)
+
+
+def _retry_from_step(instance_id: int, template: dict, instance: dict, step_id: str):
+    import backend.workflows.executors  # noqa: F401
+    from backend.workflows.cancellation import clear as cancel_clear
+    cancel_clear(instance_id)
+    db = get_workflow_db()
+    try:
+        steps = db.get_steps(instance_id)
+
+        all_outputs = {"repo": instance.get("repo", "")}
+        runtime = WorkflowRuntime(template, instance_id, db_accessor=db)
+        downstream = runtime._get_downstream_inclusive(step_id)
+
+        for s in steps:
+            if s["status"] == "completed" and s["step_id"] not in downstream and s.get("outputs_json"):
+                try:
+                    step_out = json.loads(s["outputs_json"])
+                    merge_outputs(all_outputs, step_out)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        config = json.loads(instance.get("config_json") or "{}")
+        fb_list = config.get("human_feedback", [])
+        if fb_list:
+            relevant_fb = [fb for fb in fb_list if fb.get("retry_target") not in downstream]
+            if relevant_fb:
+                all_outputs["human_feedback"] = relevant_fb
+
+        result = runtime.retry_from_step(
+            retry_step_id=step_id,
+            all_outputs=all_outputs,
+            instance_config={"repo": instance.get("repo", ""), **config},
+        )
+        _set_terminal_status(db, instance_id, result["status"])
+    except Exception as e:
+        logger.error(f"Workflow retry from {step_id} for instance {instance_id} failed: {e}")
+        _set_terminal_status(db, instance_id, "failed")
+    finally:
+        cancel_clear(instance_id)
+
+
+@workflow_engine_bp.route(
+    "/api/workflows/instances/<int:instance_id>/steps/<step_id>/download", methods=["GET"]
+)
+def download_step_output(instance_id, step_id):
+    fmt = request.args.get("format", "md")
+    db = get_workflow_db()
+    steps = db.get_steps(instance_id)
+    step = next((s for s in steps if s["step_id"] == step_id), None)
+    if not step:
+        return jsonify({"error": "Step not found"}), 404
+    if not step.get("outputs_json"):
+        return jsonify({"error": "No output available"}), 404
+
+    outputs = json.loads(step["outputs_json"])
+    step_type = step["step_type"]
+
+    WRAPPER_KEYS = {
+        "synthesis": "synthesis",
+        "holistic_review": "holistic",
+    }
+    wrapper = WRAPPER_KEYS.get(step_type)
+    if wrapper and wrapper in outputs and isinstance(outputs[wrapper], dict):
+        outputs = outputs[wrapper]
+
+    if fmt == "json":
+        content = json.dumps(outputs, indent=2)
+        mime = "application/json"
+        ext = "json"
+    else:
+        content = _outputs_to_markdown(outputs, step_type, step_id, instance_id)
+        mime = "text/markdown"
+        ext = "md"
+
+    filename = f"run-{instance_id}-{step_id}.{ext}"
+    return Response(
+        content,
+        mimetype=mime,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _outputs_to_markdown(outputs: dict, step_type: str, step_id: str, instance_id: int) -> str:
+    lines = [f"# {step_type.replace('_', ' ').title()} — Run #{instance_id}, Step: {step_id}\n"]
+
+    if step_type in ("synthesis", "holistic_review"):
+        verdict = outputs.get("verdict", "N/A")
+        summary = outputs.get("summary", "")
+        lines.append(f"## Verdict: {verdict}\n")
+        if summary:
+            lines.append(f"{summary}\n")
+
+        for section_key, label in [
+            ("blocking_findings", "Blocking Findings"),
+            ("non_blocking_findings", "Non-Blocking Findings"),
+            ("agreed", "Agreed Findings"),
+            ("a_only", "Agent A Only"),
+            ("b_only", "Agent B Only"),
+            ("cross_cutting_findings", "Cross-Cutting Findings"),
+            ("synth_findings", "SYNTH Findings"),
+        ]:
+            items = outputs.get(section_key, [])
+            if not items:
+                continue
+            lines.append(f"## {label} ({len(items)})\n")
+            for i, item in enumerate(items, 1):
+                if isinstance(item, dict):
+                    title = item.get("title", item.get("finding", {}).get("title", f"Finding {i}"))
+                    severity = item.get("severity", "")
+                    desc = item.get("description", item.get("problem", ""))
+                    sev_tag = f" [{severity}]" if severity else ""
+                    lines.append(f"{i}. **{title}**{sev_tag}")
+                    if desc:
+                        lines.append(f"   {desc}\n")
+                elif isinstance(item, str):
+                    lines.append(f"{i}. {item}")
+
+        per_domain = outputs.get("per_domain_synthesis", [])
+        if per_domain:
+            lines.append(f"## Per-Domain Synthesis ({len(per_domain)} domains)\n")
+            for ds in per_domain:
+                if isinstance(ds, dict):
+                    domain = ds.get("domain", "?")
+                    dv = ds.get("verdict", "?")
+                    tf = ds.get("total_findings", 0)
+                    lines.append(f"### {domain} — {dv} ({tf} findings)\n")
+
+        questions = outputs.get("questions", [])
+        if questions:
+            lines.append(f"## Questions ({len(questions)})\n")
+            for i, q in enumerate(questions, 1):
+                lines.append(f"{i}. {q}")
+
+    elif step_type == "agent_review":
+        reviews = outputs.get("reviews", [])
+        for r in reviews:
+            if isinstance(r, dict):
+                domain = r.get("domain", "general")
+                agent = r.get("agent_name", "?")
+                lines.append(f"## Review: {domain} (by {agent})\n")
+                content = r.get("content_md", r.get("content", r.get("review_text", "")))
+                if content:
+                    lines.append(content)
+                    lines.append("")
+
+    else:
+        lines.append("```json")
+        lines.append(json.dumps(outputs, indent=2))
+        lines.append("```")
+
+    return "\n".join(lines)

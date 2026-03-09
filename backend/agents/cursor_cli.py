@@ -1,4 +1,8 @@
-"""Claude CLI agent backend — wraps the existing subprocess-based review flow."""
+"""Cursor CLI agent backend — wraps the `agent` command for code reviews.
+
+Supports any model available through Cursor (Claude, GPT, etc.) via --model flag.
+Uses print mode (-p) for non-interactive subprocess execution.
+"""
 
 import json
 import logging
@@ -39,16 +43,9 @@ _SCHEMA_INSTRUCTIONS = (
     "problem (string), and optionally fix (string) and code_snippet (string). "
 )
 
-_ALLOWED_TOOLS = (
-    "Bash(git status*),Bash(git log*),Bash(git show*),"
-    "Bash(git diff*),Bash(git blame*),Bash(git branch*),"
-    "Bash(gh pr view*),Bash(gh pr diff*),Bash(gh pr checks*),"
-    "Bash(gh api*),Read,Glob,Grep,Write,Task"
-)
-
 
 class _ProcessState:
-    """Tracks a running Claude CLI subprocess using stream-json for live output."""
+    """Tracks a running Cursor CLI subprocess using stream-json for live output."""
     def __init__(self, process: subprocess.Popen, review_file: str, json_file: str):
         self.process = process
         self.review_file = review_file
@@ -67,17 +64,23 @@ class _ProcessState:
         self._stderr_thread.start()
 
     def _read_stream_json(self):
-        """Parse stream-json stdout, extracting text deltas for live display."""
+        """Parse stream-json stdout, extracting text deltas for live display.
+
+        Each ``assistant`` message from ``--stream-partial-output`` is
+        *cumulative* within a turn.  We track the cumulative length and
+        only append the delta so the live display shows a continuous
+        stream across multiple turns rather than replacing on each update.
+        """
         try:
             for raw_line in self.process.stdout:
                 raw_line = raw_line.strip()
                 if not raw_line:
                     continue
+                if not isinstance(raw_line, str):
+                    continue
                 try:
                     msg = json.loads(raw_line)
                 except json.JSONDecodeError:
-                    with self._lock:
-                        self._live_lines.append(raw_line + "\n")
                     continue
                 if not isinstance(msg, dict):
                     continue
@@ -115,7 +118,7 @@ class _ProcessState:
             pass
 
     def _read_stderr(self):
-        """Capture stderr separately for error reporting."""
+        """Capture stderr for error reporting."""
         try:
             for line in self.process.stderr:
                 with self._lock:
@@ -135,13 +138,21 @@ class _ProcessState:
             return "".join(self._stderr_lines[-50:])
 
 
-class ClaudeCLIAgent(AgentBackend):
-    """Runs reviews via the `claude` CLI tool as a subprocess."""
+class CursorCLIAgent(AgentBackend):
+    """Runs reviews via the Cursor `agent` CLI tool as a subprocess.
+
+    Config options:
+      - model: model name to pass via --model (e.g. "gpt-4o", "claude-3.5-sonnet")
+      - sandbox: "enabled" or "disabled" (default: "disabled" for review tool access)
+      - mode: agent mode — "agent" (default), "plan", or "ask"
+    """
 
     def __init__(self, name: str, config: dict):
         super().__init__(name, config)
         self._processes: dict[str, _ProcessState] = {}
         self.model = config.get("model")
+        self.sandbox = config.get("sandbox", "disabled")
+        self.mode = config.get("mode")
 
     def start_review(self, prompt: str, context: dict) -> AgentHandle:
         base_reviews_dir = get_reviews_dir()
@@ -168,16 +179,26 @@ class ClaudeCLIAgent(AgentBackend):
 
         full_prompt = self._build_prompt(prompt, context, str(review_file), json_file)
 
+        agent_bin = self.config.get("agent_path") or self._find_agent_binary()
         cmd = [
-            "claude",
-            "-p", full_prompt,
+            agent_bin, "--print", "--trust", "--force",
             "--output-format", "stream-json",
-            "--allowedTools", _ALLOWED_TOOLS,
-            "--dangerously-skip-permissions",
+            "--stream-partial-output",
         ]
 
         if self.model:
             cmd.extend(["--model", self.model])
+        if self.sandbox:
+            cmd.extend(["--sandbox", self.sandbox])
+        if self.mode:
+            cmd.extend(["--mode", self.mode])
+
+        if context.get("phase") == "b":
+            phase_b_dir = base_reviews_dir / "phase-b"
+            phase_b_dir.mkdir(parents=True, exist_ok=True)
+            cmd.extend(["--workspace", str(phase_b_dir)])
+
+        cmd.append(full_prompt)
 
         try:
             process = subprocess.Popen(
@@ -185,7 +206,9 @@ class ClaudeCLIAgent(AgentBackend):
                 start_new_session=True,
             )
         except FileNotFoundError:
-            raise RuntimeError("Claude CLI not found. Ensure 'claude' is installed and in PATH.")
+            raise RuntimeError(
+                "Cursor CLI not found. Install via: curl https://cursor.com/install -fsS | bash"
+            )
 
         handle_id = str(uuid.uuid4())
         self._processes[handle_id] = _ProcessState(process, str(review_file), json_file)
@@ -199,12 +222,13 @@ class ClaudeCLIAgent(AgentBackend):
         )
 
         logger.info(
-            f"ClaudeCLI: started PID {process.pid} for {owner}/{repo}#{pr_number} (handle={handle_id[:8]})"
+            f"CursorCLI: started PID {process.pid} for {owner}/{repo}#{pr_number} "
+            f"(handle={handle_id[:8]}, model={self.model or 'default'})"
         )
         return AgentHandle(
             agent_name=self.name,
             handle_id=handle_id,
-            metadata={"pid": process.pid, "review_file": str(review_file)},
+            metadata={"pid": process.pid, "review_file": str(review_file), "model": self.model},
         )
 
     def check_status(self, handle: AgentHandle) -> AgentStatus:
@@ -226,12 +250,6 @@ class ClaudeCLIAgent(AgentBackend):
 
         state.exit_code = exit_code
         return AgentStatus.COMPLETED if exit_code == 0 else AgentStatus.FAILED
-
-    def get_live_output(self, handle: AgentHandle) -> str:
-        state = self._processes.get(handle.handle_id)
-        if state is None:
-            return ""
-        return state.get_live_text()
 
     def cleanup(self, handle: AgentHandle) -> None:
         """Remove process state and close pipes to prevent FD leaks."""
@@ -284,6 +302,8 @@ class ClaudeCLIAgent(AgentBackend):
             except Exception as e:
                 logger.warning(f"Could not read markdown review: {e}")
 
+        # Fall back to captured stdout when no files were written (e.g.
+        # non-review tasks like expert_generation or synthesis).
         if content_md is None and state.stdout:
             content_md = state.stdout
 
@@ -297,6 +317,12 @@ class ClaudeCLIAgent(AgentBackend):
             file_path=state.review_file,
             score=score,
         )
+
+    def get_live_output(self, handle: AgentHandle) -> str:
+        state = self._processes.get(handle.handle_id)
+        if state is None:
+            return ""
+        return state.get_live_text()
 
     def cancel(self, handle: AgentHandle) -> bool:
         state = self._processes.get(handle.handle_id)
@@ -313,9 +339,29 @@ class ClaudeCLIAgent(AgentBackend):
             except OSError:
                 state.process.kill()
         state.exit_code = -1
-        logger.info(f"ClaudeCLI: cancelled handle {handle.handle_id[:8]}")
+        logger.info(f"CursorCLI: cancelled handle {handle.handle_id[:8]}")
         self.cleanup(handle)
         return True
+
+    @staticmethod
+    def _find_agent_binary() -> str:
+        """Locate the Cursor `agent` binary, checking common install paths."""
+        import shutil
+        from pathlib import Path as _P
+
+        found = shutil.which("agent")
+        if found:
+            return found
+
+        candidates = [
+            _P.home() / ".local" / "bin" / "agent",
+            _P("/usr/local/bin/agent"),
+        ]
+        for p in candidates:
+            if p.exists() and p.is_file():
+                return str(p)
+
+        return "agent"
 
     def _build_prompt(self, user_prompt: str, context: dict, review_file: str, json_file: str) -> str:
         pr_url = context.get("pr_url", "")
@@ -324,6 +370,8 @@ class ClaudeCLIAgent(AgentBackend):
         previous_review = context.get("previous_review_content")
         task = context.get("task", "")
 
+        # Non-review tasks (expert_generation, synthesis, holistic) — return
+        # the user prompt as-is, no file-write instructions.
         if task and task != "review":
             return user_prompt + _NON_INTERACTIVE
 
