@@ -9,14 +9,13 @@ Uses an AI agent for holistic analysis, with a heuristic fallback if the
 agent is unavailable or fails.
 """
 
-import json
 import logging
-import re
 import time
 
 from backend.agents import get_agent, AgentStatus
 from backend.workflows.executor import StepExecutor, StepResult
 from backend.workflows.executors.agent_review import _set_live_output, _clear_live_output
+from backend.workflows.json_parser import extract_json
 from backend.workflows.step_types import register_step
 
 logger = logging.getLogger(__name__)
@@ -40,7 +39,7 @@ class HolisticReviewExecutor(StepExecutor):
 
         prompt = self._build_holistic_prompt(synthesis, reviews, experts, prs, owner, repo)
 
-        agent_name = self.step_config.get("agent", "cursor-opus")
+        agent_name = self.step_config.get("agent", "claude-opus")
         try:
             agent = get_agent(agent_name)
         except Exception as e:
@@ -91,9 +90,12 @@ class HolisticReviewExecutor(StepExecutor):
                 artifact = agent.get_output(handle)
                 agent.cleanup(handle)
                 holistic = self._parse_holistic_output(artifact.content_md, synthesis)
+                outputs = {"holistic": holistic}
+                if artifact.usage:
+                    outputs["usage"] = artifact.usage
                 return StepResult(
                     success=True,
-                    outputs={"holistic": holistic},
+                    outputs=outputs,
                 )
             else:
                 agent.cleanup(handle)
@@ -260,16 +262,33 @@ class HolisticReviewExecutor(StepExecutor):
             "\n## Your Task\n\n"
             "1. **Cross-domain interaction analysis**: Identify where changes in one domain affect another\n"
             "2. **Contradiction resolution**: Flag where domain experts disagree and determine the correct interpretation\n"
-            "3. **Severity calibration**: Adjust severities considering the holistic impact\n"
+            "3. **Severity calibration**: Adjust severities considering the holistic impact. "
+            "A finding is **blocking** ONLY if you can describe a concrete production failure scenario. "
+            "If the problem requires unusual conditions or is a best-practice violation, it is non-blocking at most.\n"
             "4. **Gap detection**: Find issues that fall between domain boundaries\n"
-            "5. **Process ALL cross-cutting flags**: Assign each to a domain or elevate as a holistic finding\n"
-            "6. **Final verdict**: APPROVE, REQUEST_CHANGES, or COMMENT\n\n"
+            "5. **Silent-pass test detection**: For any test files in the PR, check whether each test function "
+            "actually asserts its stated invariant on ALL code paths. Flag tests where a conditional branch "
+            "uses `println!`, `dbg!`, `print()`, `log::info!()`, or similar non-asserting statements "
+            "instead of `assert!`, `assert_eq!`, `panic!`, or returning `Err`. "
+            "A test that can pass without verifying what its name promises is a silent-pass anti-pattern.\n"
+            "6. **Process ALL cross-cutting flags**: Assign each to a domain or elevate as a holistic finding\n"
+            "7. **Final verdict**: APPROVE, REQUEST_CHANGES, or COMMENT\n\n"
+            "## Communication Standards\n\n"
+            "Your output MUST remain professional and goal-oriented:\n"
+            "- Frame findings as improvements, not accusations. "
+            "Write 'This could be improved by...' not 'You failed to...' or 'The author neglected...'\n"
+            "- Never use words like: careless, sloppy, terrible, obviously wrong, incompetent, lazy, dangerous, reckless\n"
+            "- Severity labels describe code impact, not author competence. "
+            "'Critical' means 'production-breaking', not 'how could you write this'\n"
+            "- When uncertain, ask a question instead of asserting a bug\n"
+            "- Maintain consistent tone regardless of finding count — finding 20 should be as constructive as finding 1\n\n"
             "## Output Format\n\n"
             "Output valid JSON only:\n"
             "{\n"
             '  "verdict": "APPROVE|REQUEST_CHANGES|COMMENT",\n'
             '  "blocking_findings": [{"title": "...", "severity": "critical|major", "domain": "...", "description": "...", "evidence": "..."}],\n'
             '  "non_blocking_findings": [{"title": "...", "severity": "minor|suggestion", "domain": "...", "description": "..."}],\n'
+            '  "silent_pass_findings": [{"test_name": "...", "file": "...", "line": 0, "issue": "..."}],\n'
             '  "cross_cutting_findings": [{"title": "...", "domains": ["...", "..."], "description": "...", "origin": "flag|new"}],\n'
             '  "domain_verdicts": [{"domain": "...", "verdict": "...", "finding_count": 0}],\n'
             '  "domain_coverage": ["domain-1", "domain-2"],\n'
@@ -286,34 +305,8 @@ class HolisticReviewExecutor(StepExecutor):
     # ------------------------------------------------------------------
 
     def _parse_holistic_output(self, content: str, synthesis: dict) -> dict:
-        """Parse AI holistic review output using brace-depth counting."""
-        parsed = None
-
-        fenced = re.findall(r"```(?:json)?\s*\n(.*?)```", content, re.DOTALL)
-        text = fenced[0].strip() if fenced else content
-
-        try:
-            parsed = json.loads(text.strip())
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        if parsed is None:
-            depth = 0
-            start_idx = -1
-            for i, ch in enumerate(text):
-                if ch == '{':
-                    if depth == 0:
-                        start_idx = i
-                    depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0 and start_idx >= 0:
-                        try:
-                            parsed = json.loads(text[start_idx:i + 1])
-                            break
-                        except json.JSONDecodeError:
-                            start_idx = -1
-
+        """Parse AI holistic review output."""
+        parsed = extract_json(content)
         if parsed is None:
             logger.warning("Could not parse AI holistic JSON, falling back")
             return {
@@ -323,10 +316,12 @@ class HolisticReviewExecutor(StepExecutor):
                 "parse_failed": True,
             }
 
+        silent_pass = parsed.get("silent_pass_findings", [])
         result = {
             "verdict": parsed.get("verdict", "COMMENT"),
             "blocking_findings": parsed.get("blocking_findings", []),
             "non_blocking_findings": parsed.get("non_blocking_findings", []),
+            "silent_pass_findings": silent_pass,
             "cross_cutting_findings": parsed.get("cross_cutting_findings", []),
             "domain_verdicts": parsed.get("domain_verdicts", []),
             "domain_coverage": parsed.get("domain_coverage", []),
@@ -335,6 +330,7 @@ class HolisticReviewExecutor(StepExecutor):
             "summary": parsed.get("summary", ""),
             "total_blocking": len(parsed.get("blocking_findings", [])),
             "total_non_blocking": len(parsed.get("non_blocking_findings", [])),
+            "total_silent_pass": len(silent_pass),
             "ai_powered": True,
         }
 
@@ -373,21 +369,11 @@ class HolisticReviewExecutor(StepExecutor):
             else:
                 non_blocking.append(f)
 
-        for f in list(non_blocking):
-            if f.get("source") == "BOTH" and self._severity(f, "finding_a") == "minor":
-                inner = f.get("finding_a", {})
-                problem = inner.get("problem", "")
-                if len(problem) > 100:
-                    non_blocking.remove(f)
-                    f["_promoted"] = True
-                    blocking.append(f)
-                    log.append({
-                        "type": "promotion",
-                        "detail": (
-                            f"Promoted from non-blocking — both agents agree and "
-                            f"detailed evidence provided: {inner.get('title', '')}"
-                        ),
-                    })
+        # Note: minor findings are never promoted to blocking, even when both
+        # agents agree and provide detailed evidence. Severity inflation from
+        # automatic promotion was a key source of false escalation in reviews.
+        # Promotion to blocking should only happen via AI holistic analysis
+        # with explicit reasoning, not mechanical heuristics.
 
         return blocking, non_blocking
 

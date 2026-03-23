@@ -69,6 +69,7 @@ export interface Agent {
   type: string
   model: string
   is_active: boolean
+  config_json?: string
 }
 
 export async function listTemplates(): Promise<WorkflowTemplate[]> {
@@ -245,4 +246,22 @@ export async function listFollowups(repo?: string): Promise<ReviewFollowup[]> {
 
 export async function getFollowup(id: number): Promise<ReviewFollowup> {
   return api.get<ReviewFollowup>(`/followups/${id}`)
+}
+
+// --- Usage Stats ---
+
+export interface TemplateUsageStats {
+  template_name: string
+  run_count: number
+  total_prs: number
+  avg_input_tokens_per_run: number
+  avg_output_tokens_per_run: number
+  avg_cost_per_run: number
+  avg_input_tokens_per_pr: number
+  avg_output_tokens_per_pr: number
+  avg_cost_per_pr: number
+}
+
+export async function getUsageStats(): Promise<TemplateUsageStats[]> {
+  return api.get<TemplateUsageStats[]>('/workflows/usage-stats')
 }

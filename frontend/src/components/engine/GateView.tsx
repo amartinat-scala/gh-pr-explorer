@@ -1,13 +1,16 @@
 import { useEffect, useState } from 'react'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { Badge } from '../common/Badge'
 import { Button } from '../common/Button'
 import { Spinner } from '../common/Spinner'
 import { FindingCard } from './FindingCard'
+import { TokenUsageBreakdown, type TokenUsage, formatTokenCount } from './StepContentViewer'
 import { useWorkflowEngineStore } from '../../stores/useWorkflowEngineStore'
 import { parseContent } from '../../api/workflow-engine'
 import type { WorkflowInstance } from '../../api/workflow-engine'
 
-type GateTab = 'overview' | 'comparison' | 'publish' | 'freshness' | 'synthesis_log' | 'questions' | 'domains'
+type GateTab = 'overview' | 'comparison' | 'reviews' | 'publish' | 'freshness' | 'synthesis_log' | 'questions' | 'domains' | 'related_scan' | 'fp_check'
 
 interface GateViewProps {
   instance: WorkflowInstance
@@ -330,10 +333,52 @@ function PublishPreviewFromGate({ holisticData, synthData, reviews }: {
         <p style={{ fontSize: '12px', opacity: 0.7, marginBottom: '8px' }}>
           This is approximately what will be posted to the PR when you approve. The publish step may further deduplicate against existing comments.
         </p>
-        <pre style={{ whiteSpace: 'pre-wrap', fontSize: '12px', lineHeight: '1.5', padding: '12px', background: 'rgba(255,255,255,0.03)', borderRadius: '6px', border: '1px solid rgba(255,255,255,0.1)', maxHeight: '600px', overflow: 'auto' }}>
-          {markdown}
-        </pre>
+        <div className="mx-step-content__review-markdown" style={{ maxHeight: '600px', overflow: 'auto', padding: '12px', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '6px' }}>
+          <ReactMarkdown remarkPlugins={[remarkGfm]}>{markdown}</ReactMarkdown>
+        </div>
       </div>
+    </div>
+  )
+}
+
+function FullReviewsView({ reviews }: {
+  reviews: Array<{ pr_number?: number; domain?: string; agent_name?: string; score?: number; content_md?: string }>
+}) {
+  const [expandedIdx, setExpandedIdx] = useState<number | null>(reviews.length === 1 ? 0 : null)
+
+  if (!reviews.length) return <p className="mx-gate-view__empty">No reviews available.</p>
+
+  return (
+    <div className="mx-gate-view__overview">
+      {reviews.map((r, i) => {
+        const label = r.domain ? `${r.agent_name ?? 'Agent'} — ${r.domain}` : (r.agent_name ?? `Review ${i + 1}`)
+        const isOpen = expandedIdx === i
+        return (
+          <div key={i} className="mx-gate-view__section" style={{ padding: 0 }}>
+            <div
+              onClick={() => setExpandedIdx(isOpen ? null : i)}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px',
+                cursor: 'pointer', background: 'rgba(255,255,255,0.03)',
+                borderBottom: isOpen ? '1px solid rgba(255,255,255,0.1)' : 'none',
+              }}
+            >
+              <span>{isOpen ? '\u25BC' : '\u25B6'}</span>
+              <strong style={{ fontSize: 14 }}>{label}</strong>
+              {r.score != null && (
+                <Badge variant={r.score >= 7 ? 'success' : r.score >= 4 ? 'warning' : 'error'} size="sm">
+                  {r.score}/10
+                </Badge>
+              )}
+            </div>
+            {isOpen && r.content_md && (
+              <div className="mx-step-content__review-markdown" style={{ padding: '12px 14px' }}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{r.content_md}</ReactMarkdown>
+              </div>
+            )}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -511,6 +556,25 @@ export function GateView({ instance, onBack }: GateViewProps) {
     affected_findings?: string[]; recommendation?: string
   }>
 
+  const relatedScan = (gateOutputs?.related_scan ?? {}) as Record<string, unknown>
+  const scannedFindings = (relatedScan.scanned_findings ?? []) as Array<{
+    title?: string; related_count?: number; pattern_is_standard?: boolean; assessment?: string
+  }>
+  const likelyFPs = (relatedScan.likely_false_positives ?? []) as string[]
+  const confirmedFindings = (relatedScan.confirmed_findings ?? []) as string[]
+  const widerIssues = (relatedScan.wider_issues ?? []) as Array<{ title?: string; files?: string[]; description?: string }>
+  const hasRelatedScan = scannedFindings.length > 0 || likelyFPs.length > 0
+
+  const fpCheck = (gateOutputs?.fp_check ?? {}) as Record<string, unknown>
+  const verifiedFindings = (fpCheck.verified_findings ?? []) as Array<{
+    title?: string; original_severity?: string; calibrated_severity?: string
+    fp_status?: string; correctness_check?: string; intentionality_check?: string
+    impact_assessment?: string; evidence?: string
+  }>
+  const fpRemoved = (fpCheck.false_positives_removed ?? []) as Array<{ title?: string; reason?: string }>
+  const severityChanges = (fpCheck.severity_changes ?? []) as Array<{ title?: string; from?: string; to?: string; reason?: string }>
+  const hasFpCheck = verifiedFindings.length > 0 || fpRemoved.length > 0
+
   const blockingFindings = (holisticData.blocking_findings ?? []) as Array<Record<string, unknown>>
   const nonBlockingFindings = (holisticData.non_blocking_findings ?? []) as Array<Record<string, unknown>>
   const crossCuttingFindings = (holisticData.cross_cutting_findings ?? []) as Array<{ title?: string; domains?: string[]; description?: string; origin?: string }>
@@ -518,6 +582,24 @@ export function GateView({ instance, onBack }: GateViewProps) {
 
   const feedbackHistory = (gatePayload.feedback_history ?? []) as Array<{ feedback?: string; iteration?: number }>
   const iteration = (gatePayload.iteration ?? 1) as number
+
+  // Aggregate token usage from all steps in this run
+  const runUsage: TokenUsage = (() => {
+    const total: TokenUsage = { input_tokens: 0, output_tokens: 0 }
+    for (const s of steps) {
+      if (!s.outputs_json) continue
+      const parsed = parseContent(s.outputs_json) as Record<string, unknown> | null
+      const u = parsed?.usage as TokenUsage | undefined
+      if (!u) continue
+      total.input_tokens = (total.input_tokens ?? 0) + (u.input_tokens ?? 0)
+      total.output_tokens = (total.output_tokens ?? 0) + (u.output_tokens ?? 0)
+      if (u.cache_read_input_tokens) total.cache_read_input_tokens = (total.cache_read_input_tokens ?? 0) + u.cache_read_input_tokens
+      if (u.cache_creation_input_tokens) total.cache_creation_input_tokens = (total.cache_creation_input_tokens ?? 0) + u.cache_creation_input_tokens
+      if (u.cost_usd != null) total.cost_usd = (total.cost_usd ?? 0) + u.cost_usd
+      if (u.duration_ms != null) total.duration_ms = (total.duration_ms ?? 0) + u.duration_ms
+    }
+    return total
+  })()
 
   const handleApprove = async () => {
     setSubmitting(true)
@@ -545,9 +627,12 @@ export function GateView({ instance, onBack }: GateViewProps) {
   const tabs: { id: GateTab; label: string; show: boolean }[] = [
     { id: 'overview', label: 'Overview', show: true },
     { id: 'domains', label: `Domains (${perDomainSynthesis.length})`, show: perDomainSynthesis.length > 0 },
+    { id: 'reviews', label: `Full Reviews (${gateReviews.length})`, show: gateReviews.length > 0 },
     { id: 'comparison', label: 'Comparison', show: true },
     { id: 'synthesis_log', label: `Synthesis Log (${synthesisLog.length})`, show: synthesisLog.length > 0 },
     { id: 'questions', label: `Questions (${questions.length})`, show: questions.length > 0 },
+    { id: 'related_scan', label: `Related Scan (${scannedFindings.length})`, show: hasRelatedScan },
+    { id: 'fp_check', label: `FP Check (${verifiedFindings.length})`, show: hasFpCheck },
     { id: 'publish', label: 'Publish Preview', show: true },
     { id: 'freshness', label: 'Freshness', show: freshnessChecks.length > 0 },
   ]
@@ -611,7 +696,17 @@ export function GateView({ instance, onBack }: GateViewProps) {
           <span className="mx-gate-view__stat-value">{agreementRate}%</span>
           <span className="mx-gate-view__stat-label">Agreement</span>
         </div>
+        {(runUsage.input_tokens || runUsage.output_tokens) ? (
+          <div className="mx-gate-view__stat">
+            <span className="mx-gate-view__stat-value">{formatTokenCount((runUsage.input_tokens ?? 0) + (runUsage.output_tokens ?? 0))}</span>
+            <span className="mx-gate-view__stat-label">Tokens Used</span>
+          </div>
+        ) : null}
       </div>
+
+      {(runUsage.input_tokens || runUsage.output_tokens) ? (
+        <TokenUsageBreakdown usage={runUsage} label="Run Token Usage" />
+      ) : null}
 
       <div className="mx-gate-view__tabs">
         {tabs.filter(t => t.show).map((t) => (
@@ -727,6 +822,10 @@ export function GateView({ instance, onBack }: GateViewProps) {
           </div>
         )}
 
+        {tab === 'reviews' && (
+          <FullReviewsView reviews={gateReviews} />
+        )}
+
         {tab === 'comparison' && (
           <ComparisonView reviews={gateReviews} perDomainSynthesis={perDomainSynthesis} />
         )}
@@ -801,6 +900,127 @@ export function GateView({ instance, onBack }: GateViewProps) {
                 ))}
               </div>
             )}
+          </div>
+        )}
+
+        {tab === 'related_scan' && (
+          <div className="mx-gate-view__related-scan">
+            {likelyFPs.length > 0 && (
+              <div className="mx-gate-view__section">
+                <h4><Badge variant="warning" size="sm">Likely False Positives</Badge> <span>{likelyFPs.length} findings</span></h4>
+                <ul style={{ margin: '8px 0', paddingLeft: '20px' }}>
+                  {likelyFPs.map((fp, i) => <li key={i} style={{ marginBottom: '4px' }}>{fp}</li>)}
+                </ul>
+              </div>
+            )}
+            {confirmedFindings.length > 0 && (
+              <div className="mx-gate-view__section">
+                <h4><Badge variant="success" size="sm">Confirmed</Badge> <span>{confirmedFindings.length} findings</span></h4>
+                <ul style={{ margin: '8px 0', paddingLeft: '20px' }}>
+                  {confirmedFindings.map((cf, i) => <li key={i} style={{ marginBottom: '4px' }}>{cf}</li>)}
+                </ul>
+              </div>
+            )}
+            {widerIssues.length > 0 && (
+              <div className="mx-gate-view__section">
+                <h4><Badge variant="error" size="sm">Wider Issues</Badge> <span>{widerIssues.length} found</span></h4>
+                {widerIssues.map((wi, i) => (
+                  <div key={i} className="mx-gate-view__log-entry" style={{ padding: '8px 12px' }}>
+                    <strong>{wi.title}</strong>
+                    {wi.description && <p style={{ margin: '4px 0 0', fontSize: '13px', opacity: 0.85 }}>{wi.description}</p>}
+                    {wi.files && wi.files.length > 0 && (
+                      <div style={{ marginTop: '4px', display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+                        {wi.files.map((f, j) => <Badge key={j} variant="neutral" size="sm">{f}</Badge>)}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+            {scannedFindings.length > 0 && (
+              <div className="mx-gate-view__section">
+                <h4>Scanned Findings ({scannedFindings.length})</h4>
+                {scannedFindings.map((sf, i) => (
+                  <div key={i} className="mx-gate-view__log-entry" style={{ padding: '8px 12px' }}>
+                    <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                      <strong>{sf.title}</strong>
+                      {sf.pattern_is_standard && <Badge variant="warning" size="sm">STANDARD</Badge>}
+                      <Badge variant="neutral" size="sm">{sf.related_count ?? 0} related</Badge>
+                    </div>
+                    {sf.assessment && <p style={{ margin: '4px 0 0', fontSize: '13px', opacity: 0.85 }}>{sf.assessment}</p>}
+                  </div>
+                ))}
+              </div>
+            )}
+            {!hasRelatedScan && <p className="mx-gate-view__empty">No related scan data available.</p>}
+          </div>
+        )}
+
+        {tab === 'fp_check' && (
+          <div className="mx-gate-view__fp-check">
+            {fpRemoved.length > 0 && (
+              <div className="mx-gate-view__section">
+                <h4><Badge variant="error" size="sm">False Positives Removed</Badge> <span>{fpRemoved.length}</span></h4>
+                {fpRemoved.map((fp, i) => (
+                  <div key={i} className="mx-gate-view__log-entry" style={{ padding: '8px 12px' }}>
+                    <strong>{fp.title}</strong>
+                    {fp.reason && <p style={{ margin: '4px 0 0', fontSize: '13px', opacity: 0.85 }}>{fp.reason}</p>}
+                  </div>
+                ))}
+              </div>
+            )}
+            {severityChanges.length > 0 && (
+              <div className="mx-gate-view__section">
+                <h4><Badge variant="warning" size="sm">Severity Changes</Badge> <span>{severityChanges.length}</span></h4>
+                {severityChanges.map((sc, i) => (
+                  <div key={i} className="mx-gate-view__log-entry" style={{ padding: '8px 12px' }}>
+                    <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>
+                      <strong>{sc.title}</strong>
+                      <Badge variant="error" size="sm">{sc.from}</Badge>
+                      <span>&rarr;</span>
+                      <Badge variant="warning" size="sm">{sc.to}</Badge>
+                    </div>
+                    {sc.reason && <p style={{ margin: '4px 0 0', fontSize: '13px', opacity: 0.85 }}>{sc.reason}</p>}
+                  </div>
+                ))}
+              </div>
+            )}
+            {verifiedFindings.length > 0 && (
+              <div className="mx-gate-view__section">
+                <h4>Verified Findings ({verifiedFindings.length})</h4>
+                {verifiedFindings.map((vf, i) => {
+                  const statusVariant = vf.fp_status === 'CONFIRMED' ? 'success'
+                    : vf.fp_status === 'FALSE_POSITIVE' ? 'error'
+                    : vf.fp_status === 'DOWNGRADED' ? 'warning' : 'neutral'
+                  return (
+                    <div key={i} className="mx-gate-view__log-entry" style={{ padding: '10px 12px' }}>
+                      <div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '6px' }}>
+                        <strong>{vf.title}</strong>
+                        <Badge variant={statusVariant} size="sm">{vf.fp_status}</Badge>
+                        {vf.original_severity !== vf.calibrated_severity && (
+                          <>
+                            <Badge variant="neutral" size="sm">{vf.original_severity}</Badge>
+                            <span>&rarr;</span>
+                            <Badge variant="info" size="sm">{vf.calibrated_severity}</Badge>
+                          </>
+                        )}
+                      </div>
+                      {vf.correctness_check && (
+                        <div style={{ fontSize: '13px', marginBottom: '4px' }}><strong>Correctness:</strong> {vf.correctness_check}</div>
+                      )}
+                      {vf.intentionality_check && (
+                        <div style={{ fontSize: '13px', marginBottom: '4px' }}><strong>Intentionality:</strong> {vf.intentionality_check}</div>
+                      )}
+                      {vf.impact_assessment && (
+                        <div style={{ fontSize: '13px', marginBottom: '4px' }}><strong>Impact:</strong> {vf.impact_assessment}</div>
+                      )}
+                      {vf.evidence && <code className="mx-gate-view__log-evidence">{vf.evidence}</code>}
+                    </div>
+                  )
+                })}
+              </div>
+            )}
+            {!hasFpCheck && <p className="mx-gate-view__empty">No FP check data available.</p>}
           </div>
         )}
 

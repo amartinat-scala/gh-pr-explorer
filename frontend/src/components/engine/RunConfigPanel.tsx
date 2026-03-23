@@ -18,6 +18,8 @@ const STEP_TYPE_LABELS: Record<string, string> = {
   publish: 'Publish',
   expert_select: 'Expert Select',
   holistic_review: 'Holistic Review',
+  related_issue_scan: 'Related Scan',
+  fp_severity_check: 'FP Check',
   followup_check: 'Follow-Up Check',
   followup_action: 'Follow-Up Action',
 }
@@ -94,7 +96,8 @@ export function RunConfigPanel({ repo, onClose, onStarted }: RunConfigPanelProps
     ? (templateDetail.steps as TemplateStepDef[]) ?? []
     : []
 
-  const agentSteps = steps.filter((s) => s.type === 'agent_review')
+  const AGENT_STEP_TYPES = new Set(['agent_review', 'synthesis', 'holistic_review', 'expert_select', 'freshness_check', 'related_issue_scan', 'fp_severity_check'])
+  const agentSteps = steps.filter((s) => AGENT_STEP_TYPES.has(s.type) && (s.type === 'agent_review' || s.config?.agent || s.config?.ai_verify))
 
   const getMissingTypes = (templateId: number): string[] => {
     const types = templateStepTypes[templateId] ?? []
@@ -255,12 +258,51 @@ export function RunConfigPanel({ repo, onClose, onStarted }: RunConfigPanelProps
       {selected && agentSteps.length > 0 && agents.length > 0 && !selectedMissing.length && (
         <div className="mx-run-config__section">
           <h4>Agent Assignment</h4>
+          {agentSteps.length > 1 && (
+            <div className="mx-run-config__agent-row mx-run-config__agent-row--set-all">
+              <label>Set All</label>
+              <select
+                className="mx-select"
+                value=""
+                onChange={(e) => {
+                  if (!e.target.value) return
+                  const overrides: Record<string, string> = {}
+                  for (const s of agentSteps) {
+                    overrides[s.id] = e.target.value
+                  }
+                  setAgentOverrides((prev) => ({ ...prev, ...overrides }))
+                  e.target.value = ''
+                }}
+              >
+                <option value="">— select to apply —</option>
+                {agents.filter((a) => a.is_active).map((a) => {
+                  const cfg = a.config_json ? (() => { try { return JSON.parse(a.config_json) } catch { return {} } })() : {}
+                  const effort = cfg.effort ? ` [${cfg.effort}]` : ''
+                  return (
+                    <option key={a.name} value={a.name}>
+                      {a.name} ({a.model}){effort}
+                    </option>
+                  )
+                })}
+              </select>
+            </div>
+          )}
           <div className="mx-run-config__agents">
             {agentSteps.map((s) => {
               const defaultAgent = (s.config?.agent as string) ?? ''
+              const stepLabel: Record<string, string> = {
+                agent_review: 'Review',
+                synthesis: 'Synthesis',
+                holistic_review: 'Holistic',
+                expert_select: 'Expert Select',
+                freshness_check: 'Freshness',
+                related_issue_scan: 'Related Scan',
+                fp_severity_check: 'FP Check',
+              }
+              const label = `${stepLabel[s.type] ?? s.type}: ${s.id}`
               return (
                 <div key={s.id} className="mx-run-config__agent-row">
-                  <label>{s.id}</label>
+                  <label>{label}</label>
                   <select
                     className="mx-select"
                     value={agentOverrides[s.id] ?? defaultAgent}
@@ -268,11 +310,15 @@ export function RunConfigPanel({ repo, onClose, onStarted }: RunConfigPanelProps
                       setAgentOverrides((prev) => ({ ...prev, [s.id]: e.target.value }))
                     }
                   >
-                    {agents.filter((a) => a.is_active).map((a) => (
-                      <option key={a.name} value={a.name}>
-                        {a.name} ({a.model})
-                      </option>
-                    ))}
+                    {agents.filter((a) => a.is_active).map((a) => {
+                      const cfg = a.config_json ? (() => { try { return JSON.parse(a.config_json) } catch { return {} } })() : {}
+                      const effort = cfg.effort ? ` [${cfg.effort}]` : ''
+                      return (
+                        <option key={a.name} value={a.name}>
+                          {a.name} ({a.model}){effort}
+                        </option>
+                      )
+                    })}
                   </select>
                 </div>
               )

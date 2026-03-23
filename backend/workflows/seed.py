@@ -26,11 +26,13 @@ TEAM_REVIEW_TEMPLATE = {
         {"id": "prompt", "type": "prompt_generate", "config": {}, "position": {"x": 350, "y": 200}},
         {"id": "prompt_gate", "type": "human_gate", "config": {"gate_type": "prompt_review", "retry_target": "prompt"}, "position": {"x": 400, "y": 200}},
         {"id": "review_a", "type": "agent_review", "config": {"agent": "claude-opus", "phase": "a"}, "position": {"x": 600, "y": 100}},
-        {"id": "review_b", "type": "agent_review", "config": {"agent": "cursor-codex-xh", "phase": "b"}, "position": {"x": 600, "y": 300}},
-        {"id": "synth", "type": "synthesis", "config": {"ai_verify": True}, "position": {"x": 750, "y": 200}},
-        {"id": "fresh", "type": "freshness_check", "config": {}, "position": {"x": 900, "y": 200}},
-        {"id": "gate", "type": "human_gate", "config": {"retry_target": "synth"}, "position": {"x": 1050, "y": 200}},
-        {"id": "pub", "type": "publish", "config": {}, "position": {"x": 1200, "y": 200}},
+        {"id": "review_b", "type": "agent_review", "config": {"agent": "cursor-codex-xhigh", "phase": "b"}, "position": {"x": 600, "y": 300}},
+        {"id": "synth", "type": "synthesis", "config": {"ai_verify": True, "agent": "claude-sonnet"}, "position": {"x": 750, "y": 200}},
+        {"id": "related_scan", "type": "related_issue_scan", "config": {"agent": "claude-sonnet"}, "position": {"x": 850, "y": 200}},
+        {"id": "fp_check", "type": "fp_severity_check", "config": {"agent": "claude-sonnet"}, "position": {"x": 950, "y": 200}},
+        {"id": "fresh", "type": "freshness_check", "config": {"agent": "claude-sonnet-low"}, "position": {"x": 1100, "y": 200}},
+        {"id": "gate", "type": "human_gate", "config": {"retry_target": "synth"}, "position": {"x": 1250, "y": 200}},
+        {"id": "pub", "type": "publish", "config": {}, "position": {"x": 1400, "y": 200}},
     ],
     "edges": [
         {"from": "select", "to": "prioritize", "condition": None},
@@ -40,7 +42,9 @@ TEAM_REVIEW_TEMPLATE = {
         {"from": "prompt_gate", "to": "review_b", "condition": None},
         {"from": "review_a", "to": "synth", "condition": None},
         {"from": "review_b", "to": "synth", "condition": None},
-        {"from": "synth", "to": "fresh", "condition": None},
+        {"from": "synth", "to": "related_scan", "condition": None},
+        {"from": "related_scan", "to": "fp_check", "condition": None},
+        {"from": "fp_check", "to": "fresh", "condition": None},
         {"from": "fresh", "to": "gate", "condition": None},
         {"from": "gate", "to": "pub", "condition": None},
     ],
@@ -50,14 +54,17 @@ TEAM_REVIEW_TEMPLATE = {
 SELF_REVIEW_TEMPLATE = {
     "steps": [
         {"id": "select", "type": "pr_select", "config": {"mode": "self-review"}, "position": {"x": 50, "y": 200}},
-        {"id": "experts", "type": "expert_select", "config": {}, "position": {"x": 200, "y": 200}},
+        {"id": "experts", "type": "expert_select", "config": {"agent": "claude-sonnet"}, "position": {"x": 200, "y": 200}},
         {"id": "prompt", "type": "prompt_generate", "config": {"per_expert": True}, "position": {"x": 350, "y": 200}},
         {"id": "prompt_gate", "type": "human_gate", "config": {"gate_type": "prompt_review", "retry_target": "experts"}, "position": {"x": 400, "y": 200}},
         {"id": "review_a", "type": "agent_review", "config": {"agent": "claude-opus", "phase": "a"}, "position": {"x": 600, "y": 100}},
-        {"id": "review_b", "type": "agent_review", "config": {"agent": "cursor-codex-xh", "phase": "b"}, "position": {"x": 600, "y": 300}},
-        {"id": "synth", "type": "synthesis", "config": {"ai_verify": True}, "position": {"x": 750, "y": 200}},
-        {"id": "holistic", "type": "holistic_review", "config": {"agent": "claude-opus"}, "position": {"x": 900, "y": 200}},
-        {"id": "gate", "type": "human_gate", "config": {"retry_target": "synth"}, "position": {"x": 1050, "y": 200}},
+        {"id": "review_b", "type": "agent_review", "config": {"agent": "cursor-codex-xhigh", "phase": "b"}, "position": {"x": 600, "y": 300}},
+        {"id": "synth", "type": "synthesis", "config": {"ai_verify": True, "agent": "claude-sonnet"}, "position": {"x": 750, "y": 200}},
+        {"id": "related_scan", "type": "related_issue_scan", "config": {"agent": "claude-sonnet"}, "position": {"x": 850, "y": 200}},
+        {"id": "fp_check", "type": "fp_severity_check", "config": {"agent": "claude-sonnet"}, "position": {"x": 950, "y": 200}},
+        {"id": "holistic", "type": "holistic_review", "config": {"agent": "claude-opus"}, "position": {"x": 1100, "y": 200}},
+        {"id": "fresh", "type": "freshness_check", "config": {"agent": "claude-sonnet-low"}, "position": {"x": 1250, "y": 200}},
+        {"id": "gate", "type": "human_gate", "config": {"retry_target": "synth"}, "position": {"x": 1400, "y": 200}},
     ],
     "edges": [
         {"from": "select", "to": "experts", "condition": None},
@@ -67,8 +74,11 @@ SELF_REVIEW_TEMPLATE = {
         {"from": "prompt_gate", "to": "review_b", "condition": None},
         {"from": "review_a", "to": "synth", "condition": None},
         {"from": "review_b", "to": "synth", "condition": None},
-        {"from": "synth", "to": "holistic", "condition": None},
-        {"from": "holistic", "to": "gate", "condition": None},
+        {"from": "synth", "to": "related_scan", "condition": None},
+        {"from": "related_scan", "to": "fp_check", "condition": None},
+        {"from": "fp_check", "to": "holistic", "condition": None},
+        {"from": "holistic", "to": "fresh", "condition": None},
+        {"from": "fresh", "to": "gate", "condition": None},
     ],
     "fan_out_groups": [
         {"source": "experts", "targets": ["prompt"], "key": "domain"},
@@ -78,15 +88,18 @@ SELF_REVIEW_TEMPLATE = {
 DEEP_REVIEW_TEMPLATE = {
     "steps": [
         {"id": "select", "type": "pr_select", "config": {"mode": "deep-review"}, "position": {"x": 50, "y": 200}},
-        {"id": "experts", "type": "expert_select", "config": {}, "position": {"x": 200, "y": 200}},
+        {"id": "experts", "type": "expert_select", "config": {"agent": "claude-sonnet"}, "position": {"x": 200, "y": 200}},
         {"id": "prompt", "type": "prompt_generate", "config": {"per_expert": True}, "position": {"x": 350, "y": 200}},
         {"id": "prompt_gate", "type": "human_gate", "config": {"gate_type": "prompt_review", "retry_target": "experts"}, "position": {"x": 400, "y": 200}},
         {"id": "review_a", "type": "agent_review", "config": {"agent": "claude-opus", "phase": "a"}, "position": {"x": 600, "y": 100}},
-        {"id": "review_b", "type": "agent_review", "config": {"agent": "cursor-codex-xh", "phase": "b"}, "position": {"x": 600, "y": 300}},
-        {"id": "synth", "type": "synthesis", "config": {"ai_verify": True}, "position": {"x": 750, "y": 200}},
-        {"id": "holistic", "type": "holistic_review", "config": {"agent": "claude-opus"}, "position": {"x": 900, "y": 200}},
-        {"id": "gate", "type": "human_gate", "config": {"retry_target": "synth"}, "position": {"x": 1050, "y": 200}},
-        {"id": "pub", "type": "publish", "config": {}, "position": {"x": 1200, "y": 200}},
+        {"id": "review_b", "type": "agent_review", "config": {"agent": "cursor-codex-xhigh", "phase": "b"}, "position": {"x": 600, "y": 300}},
+        {"id": "synth", "type": "synthesis", "config": {"ai_verify": True, "agent": "claude-sonnet"}, "position": {"x": 750, "y": 200}},
+        {"id": "related_scan", "type": "related_issue_scan", "config": {"agent": "claude-sonnet"}, "position": {"x": 850, "y": 200}},
+        {"id": "fp_check", "type": "fp_severity_check", "config": {"agent": "claude-sonnet"}, "position": {"x": 950, "y": 200}},
+        {"id": "holistic", "type": "holistic_review", "config": {"agent": "claude-opus"}, "position": {"x": 1100, "y": 200}},
+        {"id": "fresh", "type": "freshness_check", "config": {"agent": "claude-sonnet-low"}, "position": {"x": 1250, "y": 200}},
+        {"id": "gate", "type": "human_gate", "config": {"retry_target": "synth"}, "position": {"x": 1400, "y": 200}},
+        {"id": "pub", "type": "publish", "config": {}, "position": {"x": 1550, "y": 200}},
     ],
     "edges": [
         {"from": "select", "to": "experts", "condition": None},
@@ -96,8 +109,11 @@ DEEP_REVIEW_TEMPLATE = {
         {"from": "prompt_gate", "to": "review_b", "condition": None},
         {"from": "review_a", "to": "synth", "condition": None},
         {"from": "review_b", "to": "synth", "condition": None},
-        {"from": "synth", "to": "holistic", "condition": None},
-        {"from": "holistic", "to": "gate", "condition": None},
+        {"from": "synth", "to": "related_scan", "condition": None},
+        {"from": "related_scan", "to": "fp_check", "condition": None},
+        {"from": "fp_check", "to": "holistic", "condition": None},
+        {"from": "holistic", "to": "fresh", "condition": None},
+        {"from": "fresh", "to": "gate", "condition": None},
         {"from": "gate", "to": "pub", "condition": None},
     ],
     "fan_out_groups": [
@@ -127,11 +143,21 @@ BUILTIN_TEMPLATES = [
 ]
 
 BUILTIN_AGENTS = [
+    # Claude CLI agents — effort levels: low, medium, high (default), max
     ("claude-opus", "claude_cli", "claude-opus-4-6", {}),
-    ("cursor-codex", "cursor_cli", "gpt-5.3-codex-high", {"sandbox": "disabled"}),
-    ("cursor-codex-xh", "cursor_cli", "gpt-5.4-xhigh", {"sandbox": "disabled"}),
-    ("openai", "openai_api", "gpt-4o", {"api_key_env": "OPENAI_API_KEY"}),
-    ("claude", "claude_cli", "claude-opus-4-6", {}),
+    ("claude-opus-low", "claude_cli", "claude-opus-4-6", {"effort": "low"}),
+    ("claude-opus-max", "claude_cli", "claude-opus-4-6", {"effort": "max"}),
+    ("claude-sonnet", "claude_cli", "claude-sonnet-4-6", {}),
+    ("claude-sonnet-low", "claude_cli", "claude-sonnet-4-6", {"effort": "low"}),
+    ("claude-sonnet-max", "claude_cli", "claude-sonnet-4-6", {"effort": "max"}),
+    ("claude-haiku", "claude_cli", "claude-haiku-4-5-20251001", {}),
+    ("claude-haiku-low", "claude_cli", "claude-haiku-4-5-20251001", {"effort": "low"}),
+    # Cursor CLI agents (via Cursor's agent runtime)
+    ("cursor-opus-thinking", "cursor_cli", "opus-4.6-thinking", {"sandbox": "disabled"}),
+    ("cursor-codex-high", "cursor_cli", "gpt-5.3-codex-high", {"sandbox": "disabled"}),
+    ("cursor-codex-xhigh", "cursor_cli", "gpt-5.4-xhigh", {"sandbox": "disabled"}),
+    # OpenAI API
+    ("openai-gpt4o", "openai_api", "gpt-4o", {"api_key_env": "OPENAI_API_KEY"}),
 ]
 
 CODE_OWNERS = [
@@ -470,8 +496,17 @@ def seed_builtin_data():
         if existing is None:
             db.create_template(name, description, template, is_builtin=True)
             logger.info(f"Seeded built-in template: {name}")
+        elif existing.get("is_builtin"):
+            import json as _json
+            with db.db.connection() as conn:
+                conn.execute(
+                    "UPDATE workflow_templates SET description=?, template_json=?, "
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (description, _json.dumps(template), existing["id"]),
+                )
+            logger.info(f"Updated built-in template: {name}")
         else:
-            logger.debug(f"Built-in template '{name}' already exists")
+            logger.debug(f"Template '{name}' exists (user-modified), skipping")
 
     for name, agent_type, model, config in BUILTIN_AGENTS:
         db.upsert_agent(name, agent_type, model, config)

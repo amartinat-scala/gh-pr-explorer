@@ -236,8 +236,8 @@ class Database:
                     try:
                         cursor.execute(f"ALTER TABLE reviews ADD COLUMN {col_name} {col_type}")
                         logger.info(f"Added column {col_name} to reviews table")
-                    except sqlite3.OperationalError:
-                        pass
+                    except sqlite3.OperationalError as e:
+                        logger.debug(f"Column {col_name} migration skipped: {e}")
 
             # Migration: Add new columns to developer_stats for existing databases
             cursor.execute("PRAGMA table_info(developer_stats)")
@@ -256,16 +256,16 @@ class Database:
                     try:
                         cursor.execute(f"ALTER TABLE developer_stats ADD COLUMN {col_name} {col_type}")
                         logger.info(f"Added column {col_name} to developer_stats table")
-                    except sqlite3.OperationalError:
-                        pass
+                    except sqlite3.OperationalError as e:
+                        logger.debug(f"Column {col_name} migration skipped: {e}")
 
             # Migration: Add agent_name column to reviews
             if "agent_name" not in reviews_columns:
                 try:
                     cursor.execute("ALTER TABLE reviews ADD COLUMN agent_name TEXT")
                     logger.info("Added column agent_name to reviews table")
-                except sqlite3.OperationalError:
-                    pass
+                except sqlite3.OperationalError as e:
+                    logger.debug(f"agent_name migration skipped: {e}")
 
             # --- Workflow Engine Tables ---
 
@@ -530,6 +530,30 @@ class Database:
                     logger.info("Migrated followup tables to use ON DELETE CASCADE")
                 except Exception as e:
                     logger.warning(f"CASCADE migration skipped: {e}")
+
+            # Migration: add usage_json and pr_count to workflow_instances
+            if not self.is_migration_done_raw(cursor, "add_usage_columns"):
+                wi_cols = {
+                    col[1]
+                    for col in cursor.execute("PRAGMA table_info(workflow_instances)").fetchall()
+                }
+                try:
+                    if "usage_json" not in wi_cols:
+                        cursor.execute(
+                            "ALTER TABLE workflow_instances ADD COLUMN usage_json TEXT"
+                        )
+                        logger.info("Added column usage_json to workflow_instances")
+                    if "pr_count" not in wi_cols:
+                        cursor.execute(
+                            "ALTER TABLE workflow_instances ADD COLUMN pr_count INTEGER DEFAULT 0"
+                        )
+                        logger.info("Added column pr_count to workflow_instances")
+                    cursor.execute(
+                        "INSERT OR IGNORE INTO migrations (name) VALUES (?)",
+                        ("add_usage_columns",),
+                    )
+                except sqlite3.OperationalError as e:
+                    logger.debug(f"Usage columns migration skipped: {e}")
 
             logger.info(f"Database initialized at {self.db_path}")
 

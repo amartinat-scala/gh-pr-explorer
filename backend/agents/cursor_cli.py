@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from backend.agents.base import AgentBackend, AgentHandle, AgentStatus, ReviewArtifact
+from backend.agents.base import AgentBackend, AgentHandle, AgentStatus, ReviewArtifact, normalize_usage
 from backend.agents.pid_tracker import register_pid, unregister_pid
 from backend.config import get_reviews_dir
 from backend.services.review_schema import (
@@ -56,6 +56,10 @@ class _ProcessState:
         self._live_lines: list[str] = []
         self._stderr_lines: list[str] = []
         self._result_text: Optional[str] = None
+        self._usage: Optional[dict] = None
+        self._cost_usd: Optional[float] = None
+        self._duration_ms: Optional[int] = None
+        self._num_turns: Optional[int] = None
         self._lock = threading.Lock()
         self._last_full: str = ""
         self._stdout_thread = threading.Thread(target=self._read_stream_json, daemon=True)
@@ -114,6 +118,10 @@ class _ProcessState:
                 elif msg_type == "result":
                     with self._lock:
                         self._result_text = msg.get("result", "")
+                        self._usage = msg.get("usage")
+                        self._cost_usd = msg.get("cost_usd")
+                        self._duration_ms = msg.get("duration_ms")
+                        self._num_turns = msg.get("num_turns")
         except (ValueError, OSError):
             pass
 
@@ -150,6 +158,7 @@ class CursorCLIAgent(AgentBackend):
     def __init__(self, name: str, config: dict):
         super().__init__(name, config)
         self._processes: dict[str, _ProcessState] = {}
+        self._lock = threading.Lock()
         self.model = config.get("model")
         self.sandbox = config.get("sandbox", "disabled")
         self.mode = config.get("mode")
@@ -201,9 +210,12 @@ class CursorCLIAgent(AgentBackend):
         cmd.append(full_prompt)
 
         try:
+            import os
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("CLAUDECODE", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")}
             process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                start_new_session=True,
+                start_new_session=True, env=env,
             )
         except FileNotFoundError:
             raise RuntimeError(
@@ -211,7 +223,8 @@ class CursorCLIAgent(AgentBackend):
             )
 
         handle_id = str(uuid.uuid4())
-        self._processes[handle_id] = _ProcessState(process, str(review_file), json_file)
+        with self._lock:
+            self._processes[handle_id] = _ProcessState(process, str(review_file), json_file)
 
         register_pid(
             process.pid,
@@ -232,7 +245,8 @@ class CursorCLIAgent(AgentBackend):
         )
 
     def check_status(self, handle: AgentHandle) -> AgentStatus:
-        state = self._processes.get(handle.handle_id)
+        with self._lock:
+            state = self._processes.get(handle.handle_id)
         if state is None:
             return AgentStatus.FAILED
 
@@ -253,7 +267,8 @@ class CursorCLIAgent(AgentBackend):
 
     def cleanup(self, handle: AgentHandle) -> None:
         """Remove process state and close pipes to prevent FD leaks."""
-        state = self._processes.pop(handle.handle_id, None)
+        with self._lock:
+            state = self._processes.pop(handle.handle_id, None)
         if state is None:
             return
         unregister_pid(state.process.pid)
@@ -269,7 +284,8 @@ class CursorCLIAgent(AgentBackend):
             pass
 
     def get_output(self, handle: AgentHandle) -> ReviewArtifact:
-        state = self._processes.get(handle.handle_id)
+        with self._lock:
+            state = self._processes.get(handle.handle_id)
         if state is None:
             return ReviewArtifact(error="Unknown handle")
 
@@ -278,6 +294,26 @@ class CursorCLIAgent(AgentBackend):
 
         review_path = Path(state.review_file)
         json_path = Path(state.json_file)
+
+        # If files not at expected path, search workspace and phase-b dirs
+        if not review_path.exists() or not json_path.exists():
+            base_name = review_path.name
+            json_name = Path(state.json_file).name
+            search_dirs = [
+                review_path.parent,
+                Path(get_reviews_dir()) / "phase-b",
+            ]
+            for d in search_dirs:
+                if not d.exists():
+                    continue
+                for found in d.rglob(base_name):
+                    review_path = found
+                    break
+                for found in d.rglob(json_name):
+                    json_path = found
+                    break
+                if review_path.exists():
+                    break
 
         content_json = None
         content_md = None
@@ -290,7 +326,7 @@ class CursorCLIAgent(AgentBackend):
                 if valid:
                     content_json = parsed
                 else:
-                    logger.warning(f"JSON validation failed: {errs[:3]}")
+                    logger.warning(f"JSON validation failed for {json_path}: {errs[:3]}")
             except Exception as e:
                 logger.warning(f"Could not parse JSON review: {e}")
 
@@ -302,30 +338,45 @@ class CursorCLIAgent(AgentBackend):
             except Exception as e:
                 logger.warning(f"Could not read markdown review: {e}")
 
-        # Fall back to captured stdout when no files were written (e.g.
-        # non-review tasks like expert_generation or synthesis).
-        if content_md is None and state.stdout:
-            content_md = state.stdout
+        # Fall back to captured output when no files were written.
+        # Prefer full live text over _result_text (which is just a summary).
+        if content_md is None:
+            live = state.get_live_text()
+            content_md = live if live else state.stdout
 
         score = None
         if content_json and "score" in content_json:
             score = content_json["score"].get("overall")
+
+        usage = None
+        with state._lock:
+            if state._usage:
+                usage = normalize_usage(state._usage)
+                if state._cost_usd is not None:
+                    usage["cost_usd"] = state._cost_usd
+                if state._duration_ms is not None:
+                    usage["duration_ms"] = state._duration_ms
+                if state._num_turns is not None:
+                    usage["num_turns"] = state._num_turns
 
         return ReviewArtifact(
             content_md=content_md,
             content_json=content_json,
             file_path=state.review_file,
             score=score,
+            usage=usage,
         )
 
     def get_live_output(self, handle: AgentHandle) -> str:
-        state = self._processes.get(handle.handle_id)
+        with self._lock:
+            state = self._processes.get(handle.handle_id)
         if state is None:
             return ""
         return state.get_live_text()
 
     def cancel(self, handle: AgentHandle) -> bool:
-        state = self._processes.get(handle.handle_id)
+        with self._lock:
+            state = self._processes.get(handle.handle_id)
         if state is None or state.exit_code is not None:
             return False
         try:
